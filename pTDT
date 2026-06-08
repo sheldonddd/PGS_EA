@@ -1,0 +1,560 @@
+# pTDT analysis with sex-stratified fixed-effect meta-analysis
+#
+# This script runs polygenic transmission disequilibrium tests (pTDT)
+# for ASD probands and unaffected siblings in discovery and replication
+# cohorts, followed by fixed-effect inverse-variance weighted meta-analysis.
+#
+# Required input files:
+#   1. Discovery cohort information file
+#   2. Replication cohort information file
+#
+# Required columns in each input file:
+#   keep, sex, asd,
+#   EA, CP, NON_COG,
+#   fa_EA, fa_CP, fa_NON_COG,
+#   mo_EA, mo_CP, mo_NON_COG
+#
+# Notes:
+#   - Replace the placeholder paths below with your own project paths.
+#   - Do not commit local absolute paths or private directories to GitHub.
+
+library(data.table)
+library(openxlsx)
+library(dplyr)
+library(ggplot2)
+library(grid)
+library(patchwork)
+
+# ------------------------------------------------------------------------------
+# 1. Input paths and basic data cleaning
+# ------------------------------------------------------------------------------
+
+discovery_info_path   <- "path/to/info_discovery.xlsx"
+replication_info_path <- "path/to/info_replication.xlsx"
+output_result_path    <- "path/to/pTDT_sex_stratified_results.xlsx"
+
+info_D <- read.xlsx(discovery_info_path)
+info_R <- read.xlsx(replication_info_path)
+
+# Keep samples that passed upstream quality control.
+info_D <- info_D %>% filter(keep == 1)
+info_R <- info_R %>% filter(keep == 1)
+
+# Standardize sex labels by removing leading or trailing whitespace.
+info_D$sex <- trimws(as.character(info_D$sex))
+info_R$sex <- trimws(as.character(info_R$sex))
+
+# Optional checks for sex coding.
+unique(info_D$sex)
+unique(info_R$sex)
+
+# ------------------------------------------------------------------------------
+# 2. Define PGS traits included in the pTDT analysis
+# ------------------------------------------------------------------------------
+
+PRS_LIST <- c("EA", "CP", "NON_COG")
+
+# ------------------------------------------------------------------------------
+# 3. Run pTDT for one PGS in one dataset
+# ------------------------------------------------------------------------------
+
+run_pTDT_one <- function(df, child, father, mother, min_n = 10) {
+  df <- as.data.frame(df)
+
+  # Check whether all required columns are present.
+  need_cols <- c(child, father, mother)
+  miss_cols <- setdiff(need_cols, colnames(df))
+
+  if (length(miss_cols) > 0) {
+    return(data.frame(
+      PRS       = child,
+      n         = 0,
+      mean_pTDT = NA,
+      sd_pTDT   = NA,
+      se_pTDT   = NA,
+      ci_lower  = NA,
+      ci_upper  = NA,
+      t         = NA,
+      p         = NA,
+      note      = paste0("Missing columns: ", paste(miss_cols, collapse = ", "))
+    ))
+  }
+
+  # Use complete trios only for the selected child, paternal, and maternal PGS.
+  sub <- df[, need_cols, drop = FALSE]
+  sub <- sub[complete.cases(sub), , drop = FALSE]
+  n <- nrow(sub)
+
+  if (n < min_n) {
+    return(data.frame(
+      PRS       = child,
+      n         = n,
+      mean_pTDT = NA,
+      sd_pTDT   = NA,
+      se_pTDT   = NA,
+      ci_lower  = NA,
+      ci_upper  = NA,
+      t         = NA,
+      p         = NA,
+      note      = paste0("n<", min_n)
+    ))
+  }
+
+  # Mid-parent PGS is defined as the average of paternal and maternal PGS.
+  PRS_MP <- (sub[[father]] + sub[[mother]]) / 2
+  sd_MP <- sd(PRS_MP)
+
+  if (is.na(sd_MP) || sd_MP == 0) {
+    return(data.frame(
+      PRS       = child,
+      n         = n,
+      mean_pTDT = NA,
+      sd_pTDT   = NA,
+      se_pTDT   = NA,
+      ci_lower  = NA,
+      ci_upper  = NA,
+      t         = NA,
+      p         = NA,
+      note      = "sd(mid-parent)==0 or NA"
+    ))
+  }
+
+  # pTDT deviation: child PGS minus mid-parent PGS, scaled by the SD of mid-parent PGS.
+  pTDT_dev <- (sub[[child]] - PRS_MP) / sd_MP
+
+  # Test whether the mean pTDT deviation differs from zero.
+  tt <- t.test(pTDT_dev, mu = 0)
+
+  mean_pTDT <- mean(pTDT_dev)
+  sd_pTDT   <- sd(pTDT_dev)
+  se_pTDT   <- sd_pTDT / sqrt(n)
+
+  data.frame(
+    PRS       = child,
+    n         = n,
+    mean_pTDT = mean_pTDT,
+    sd_pTDT   = sd_pTDT,
+    se_pTDT   = se_pTDT,
+    ci_lower  = mean_pTDT - 1.96 * se_pTDT,
+    ci_upper  = mean_pTDT + 1.96 * se_pTDT,
+    t         = unname(tt$statistic),
+    p         = tt$p.value,
+    note      = ""
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 4. Run pTDT for all selected PGS traits in one dataset
+# ------------------------------------------------------------------------------
+
+run_pTDT_set <- function(df, set_name, prs_vec = NULL) {
+  if (is.null(prs_vec)) prs_vec <- PRS_LIST
+
+  out <- do.call(rbind, lapply(prs_vec, function(prs) {
+    run_pTDT_one(
+      df     = df,
+      child  = prs,
+      father = paste0("fa_", prs),
+      mother = paste0("mo_", prs)
+    )
+  }))
+
+  out$set <- set_name
+  out <- out[, c(
+    "set", "PRS", "n", "mean_pTDT", "sd_pTDT", "se_pTDT",
+    "ci_lower", "ci_upper", "t", "p", "note"
+  )]
+
+  out
+}
+
+# ------------------------------------------------------------------------------
+# 5. Fixed-effect inverse-variance weighted meta-analysis across two cohorts
+# ------------------------------------------------------------------------------
+
+meta_ivw_two <- function(df1, df2,
+                         label1 = "discovery",
+                         label2 = "replication") {
+  stopifnot(all(c("PRS", "mean_pTDT", "se_pTDT", "n") %in% colnames(df1)))
+  stopifnot(all(c("PRS", "mean_pTDT", "se_pTDT", "n") %in% colnames(df2)))
+
+  a <- df1 %>%
+    select(PRS, n, mean_pTDT, se_pTDT) %>%
+    rename(n1 = n, b1 = mean_pTDT, se1 = se_pTDT)
+
+  b <- df2 %>%
+    select(PRS, n, mean_pTDT, se_pTDT) %>%
+    rename(n2 = n, b2 = mean_pTDT, se2 = se_pTDT)
+
+  m <- inner_join(a, b, by = "PRS")
+
+  # Keep only valid estimates with positive standard errors.
+  m <- m %>%
+    filter(
+      is.finite(b1), is.finite(se1), se1 > 0,
+      is.finite(b2), is.finite(se2), se2 > 0
+    )
+
+  if (nrow(m) == 0) return(data.frame())
+
+  w1 <- 1 / (m$se1^2)
+  w2 <- 1 / (m$se2^2)
+
+  beta_meta <- (w1 * m$b1 + w2 * m$b2) / (w1 + w2)
+  se_meta   <- sqrt(1 / (w1 + w2))
+  z_meta    <- beta_meta / se_meta
+  p_meta    <- 2 * pnorm(abs(z_meta), lower.tail = FALSE)
+
+  # Heterogeneity statistics for two-cohort meta-analysis.
+  Q  <- w1 * (m$b1 - beta_meta)^2 + w2 * (m$b2 - beta_meta)^2
+  df <- 1
+  I2 <- ifelse(Q > 0, pmax(0, (Q - df) / Q) * 100, 0)
+
+  out <- m %>%
+    mutate(
+      beta_meta  = beta_meta,
+      se_meta    = se_meta,
+      z_meta     = z_meta,
+      p_meta     = p_meta,
+      ci_lower   = beta_meta - 1.96 * se_meta,
+      ci_upper   = beta_meta + 1.96 * se_meta,
+      Q          = Q,
+      I2         = I2,
+      meta_method = "Fixed-effect IVW",
+      cohort1    = label1,
+      cohort2    = label2
+    ) %>%
+    select(
+      PRS,
+      n1, b1, se1,
+      n2, b2, se2,
+      beta_meta, se_meta, z_meta, p_meta, ci_lower, ci_upper,
+      Q, I2, meta_method, cohort1, cohort2
+    )
+
+  out
+}
+
+# ------------------------------------------------------------------------------
+# 6. Run pTDT and meta-analysis for one sex stratum
+# ------------------------------------------------------------------------------
+
+run_one_stratum <- function(info_D, info_R, sex_group = NULL, min_n = 10) {
+  if (is.null(sex_group)) {
+    d_sub <- info_D
+    r_sub <- info_R
+    sex_label <- "Overall"
+  } else {
+    d_sub <- info_D %>% filter(sex == sex_group)
+    r_sub <- info_R %>% filter(sex == sex_group)
+    sex_label <- sex_group
+  }
+
+  # Split each cohort into ASD probands and unaffected siblings.
+  d_asd <- d_sub %>% filter(asd == TRUE)
+  d_sib <- d_sub %>% filter(asd == FALSE)
+  r_asd <- r_sub %>% filter(asd == TRUE)
+  r_sib <- r_sub %>% filter(asd == FALSE)
+
+  # Single-cohort pTDT results.
+  res_D_asd <- run_pTDT_set(d_asd, paste0("discovery_asd_", sex_label))
+  res_D_sib <- run_pTDT_set(d_sib, paste0("discovery_sib_", sex_label))
+  res_R_asd <- run_pTDT_set(r_asd, paste0("replication_asd_", sex_label))
+  res_R_sib <- run_pTDT_set(r_sib, paste0("replication_sib_", sex_label))
+
+  # Meta-analysis results.
+  meta_asd <- meta_ivw_two(
+    res_D_asd, res_R_asd,
+    label1 = paste0("discovery_asd_", sex_label),
+    label2 = paste0("replication_asd_", sex_label)
+  )
+
+  meta_sib <- meta_ivw_two(
+    res_D_sib, res_R_sib,
+    label1 = paste0("discovery_sib_", sex_label),
+    label2 = paste0("replication_sib_", sex_label)
+  )
+
+  if (nrow(meta_asd) > 0) {
+    meta_asd <- meta_asd %>%
+      mutate(group2 = "ASD", sex_group = sex_label)
+  }
+
+  if (nrow(meta_sib) > 0) {
+    meta_sib <- meta_sib %>%
+      mutate(group2 = "Sibling", sex_group = sex_label)
+  }
+
+  meta_all <- bind_rows(meta_asd, meta_sib)
+
+  # Bonferroni correction within each stratum:
+  # 3 PGS traits x 2 groups = 6 tests.
+  if (nrow(meta_all) > 0) {
+    meta_all <- meta_all %>%
+      mutate(
+        p_bonf_6 = p.adjust(p_meta, method = "bonferroni", n = 6)
+      )
+  }
+
+  list(
+    res_D_asd = res_D_asd,
+    res_D_sib = res_D_sib,
+    res_R_asd = res_R_asd,
+    res_R_sib = res_R_sib,
+    meta_asd  = meta_asd,
+    meta_sib  = meta_sib,
+    meta_all  = meta_all
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 7. Run analyses for overall, male, and female strata
+# ------------------------------------------------------------------------------
+
+ptdt_overall <- run_one_stratum(info_D, info_R, sex_group = NULL)
+ptdt_male    <- run_one_stratum(info_D, info_R, sex_group = "Male")
+ptdt_female  <- run_one_stratum(info_D, info_R, sex_group = "Female")
+
+# Optional interactive checks in RStudio.
+View(ptdt_overall$meta_all)
+View(ptdt_male$meta_all)
+View(ptdt_female$meta_all)
+
+# ------------------------------------------------------------------------------
+# 8. Combine and export meta-analysis results
+# ------------------------------------------------------------------------------
+
+meta_all_strata <- bind_rows(
+  ptdt_overall$meta_all,
+  ptdt_male$meta_all,
+  ptdt_female$meta_all
+)
+
+View(meta_all_strata)
+
+# Uncomment this line to export the combined results.
+# write.xlsx(meta_all_strata, output_result_path)
+
+# ------------------------------------------------------------------------------
+# 9. Plotting function for one pTDT meta-analysis panel
+# ------------------------------------------------------------------------------
+
+plot_meta_ptdt_combined_ng <- function(meta_asd, meta_sib, title = NULL,
+                                       y_limits = NULL,
+                                       show_legend = TRUE) {
+  plot_df <- bind_rows(
+    meta_asd %>% mutate(group2 = "ASD"),
+    meta_sib %>% mutate(group2 = "Sibling")
+  )
+
+  prs_order <- c("EA", "CP", "NON_COG")
+
+  plot_df <- plot_df %>%
+    mutate(
+      PRS = factor(PRS, levels = prs_order),
+      group2 = factor(group2, levels = c("ASD", "Sibling"))
+    ) %>%
+    arrange(PRS, group2) %>%
+    mutate(
+      sig = case_when(
+        p_meta < 0.001 / 6 ~ "***",
+        p_meta < 0.01  / 6 ~ "**",
+        p_meta < 0.05  / 6 ~ "*",
+        TRUE ~ ""
+      )
+    )
+
+  # Return an empty placeholder plot if no valid results are available.
+  if (nrow(plot_df) == 0) {
+    return(
+      ggplot() +
+        theme_void(base_size = 7) +
+        labs(title = title) +
+        annotate(
+          "text",
+          x = 0,
+          y = 0,
+          label = "No valid results",
+          size = 7 / ggplot2::.pt
+        )
+    )
+  }
+
+  # Determine the vertical location of significance labels.
+  y_range <- max(plot_df$ci_upper, na.rm = TRUE) -
+    min(plot_df$ci_lower, na.rm = TRUE)
+
+  if (!is.finite(y_range) || y_range == 0) y_range <- 0.1
+
+  y_pad <- 0.06 * y_range
+
+  plot_df <- plot_df %>%
+    mutate(sig_y = ci_upper + y_pad)
+
+  dodge <- position_dodge(width = 0.42)
+
+  # Use an automatic y-axis range unless a shared range is provided.
+  if (is.null(y_limits)) {
+    y_limits <- c(
+      min(plot_df$ci_lower, na.rm = TRUE) - 0.08 * y_range,
+      max(plot_df$sig_y,   na.rm = TRUE) + 0.10 * y_range
+    )
+  }
+
+  p <- ggplot(plot_df, aes(x = PRS, y = beta_meta, group = group2)) +
+    geom_hline(
+      yintercept = 0,
+      linetype = "dashed",
+      linewidth = 0.38,
+      color = "black"
+    ) +
+    geom_errorbar(
+      aes(ymin = ci_lower, ymax = ci_upper),
+      width = 0.10,
+      linewidth = 0.60,
+      color = "black",
+      position = dodge
+    ) +
+    geom_point(
+      aes(fill = group2),
+      shape = 21,
+      size = 3.1,
+      stroke = 0.60,
+      color = "black",
+      position = dodge
+    ) +
+    geom_text(
+      aes(y = sig_y, label = sig),
+      position = dodge,
+      size = 7 / ggplot2::.pt,
+      color = "black",
+      vjust = 0
+    ) +
+    scale_x_discrete(
+      breaks = c("EA", "CP", "NON_COG"),
+      labels = c(
+        expression(PGS[EA]),
+        expression(PGS[CP]),
+        expression(PGS[NON-COG])
+      )
+    ) +
+    scale_fill_manual(
+      values = c(
+        "ASD"     = "#4C78A8",
+        "Sibling" = "#B8B8B8"
+      )
+    ) +
+    labs(
+      title = title,
+      x = NULL,
+      y = "PGS deviation",
+      fill = NULL
+    ) +
+    coord_cartesian(
+      ylim = y_limits,
+      clip = "off"
+    ) +
+    theme_classic(base_size = 7) +
+    theme(
+      axis.line = element_line(linewidth = 0.6, color = "black"),
+      axis.ticks = element_line(linewidth = 0.5, color = "black"),
+      axis.ticks.length = unit(2.2, "mm"),
+
+      axis.text.x = element_text(size = 7, color = "black"),
+      axis.text.y = element_text(size = 7, color = "black"),
+      axis.title.y = element_text(size = 7, color = "black"),
+
+      plot.title = element_text(size = 7, face = "bold", hjust = 0.5),
+
+      legend.position = if (show_legend) "top" else "none",
+      legend.direction = "horizontal",
+      legend.text = element_text(size = 7, color = "black"),
+      legend.key.size = unit(0.7, "lines"),
+
+      plot.margin = margin(8, 14, 8, 8)
+    ) +
+    guides(
+      fill = guide_legend(override.aes = list(shape = 21, size = 3))
+    )
+
+  return(p)
+}
+
+# ------------------------------------------------------------------------------
+# 10. Compute a shared y-axis range for all three panels
+# ------------------------------------------------------------------------------
+
+get_common_ylim <- function(...) {
+  lst <- list(...)
+
+  all_df <- bind_rows(lapply(lst, function(x) {
+    bind_rows(
+      x$meta_asd %>% mutate(group2 = "ASD"),
+      x$meta_sib %>% mutate(group2 = "Sibling")
+    )
+  }))
+
+  if (nrow(all_df) == 0) return(c(-0.2, 0.2))
+
+  y_range <- max(all_df$ci_upper, na.rm = TRUE) -
+    min(all_df$ci_lower, na.rm = TRUE)
+
+  if (!is.finite(y_range) || y_range == 0) y_range <- 0.1
+
+  all_df <- all_df %>%
+    mutate(
+      sig = case_when(
+        p_meta < 0.001 / 6 ~ "***",
+        p_meta < 0.01  / 6 ~ "**",
+        p_meta < 0.05  / 6 ~ "*",
+        TRUE ~ ""
+      ),
+      sig_y = ci_upper + 0.06 * y_range
+    )
+
+  c(
+    min(all_df$ci_lower, na.rm = TRUE) - 0.08 * y_range,
+    max(all_df$sig_y,   na.rm = TRUE) + 0.10 * y_range
+  )
+}
+
+common_ylim <- get_common_ylim(ptdt_overall, ptdt_male, ptdt_female)
+
+# ------------------------------------------------------------------------------
+# 11. Generate sex-stratified pTDT meta-analysis plots
+# ------------------------------------------------------------------------------
+
+p_overall <- plot_meta_ptdt_combined_ng(
+  meta_asd = ptdt_overall$meta_asd,
+  meta_sib = ptdt_overall$meta_sib,
+  title = "Overall",
+  y_limits = common_ylim,
+  show_legend = TRUE
+)
+
+p_male <- plot_meta_ptdt_combined_ng(
+  meta_asd = ptdt_male$meta_asd,
+  meta_sib = ptdt_male$meta_sib,
+  title = "Male",
+  y_limits = common_ylim,
+  show_legend = FALSE
+)
+
+p_female <- plot_meta_ptdt_combined_ng(
+  meta_asd = ptdt_female$meta_asd,
+  meta_sib = ptdt_female$meta_sib,
+  title = "Female",
+  y_limits = common_ylim,
+  show_legend = FALSE
+)
+
+# Combine the three panels into one figure.
+p_ptdt_sex_panel <- p_overall + p_male + p_female +
+  plot_layout(ncol = 3, guides = "collect") &
+  theme(
+    legend.position = "top",
+    legend.justification = "center",
+    legend.text = element_text(size = 7, color = "black")
+  )
+
+p_ptdt_sex_panel
