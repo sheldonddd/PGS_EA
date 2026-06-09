@@ -1,0 +1,913 @@
+# =============================================================================
+# Trio-based association models for ASD phenotypes
+# =============================================================================
+#
+# Description:
+# This script evaluates direct offspring and indirect parental polygenic score
+# effects on ASD-related quantitative and binary phenotypes. Discovery and
+# replication results are combined using fixed-effect meta-analysis, followed by
+# publication-ready visualization.
+#
+# Notes:
+# - Replace the file paths below with your own local or project paths.
+# - The input files should contain sample-level phenotype, PGS, ancestry PC,
+#   sex, ASD status, and keep-filter information.
+# - The analysis logic is unchanged from the original working script.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1. Load packages
+# -----------------------------------------------------------------------------
+
+library(data.table)
+library(openxlsx)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(grid)
+library(scales)
+
+
+# -----------------------------------------------------------------------------
+# 2. User-defined paths and global settings
+# -----------------------------------------------------------------------------
+
+phenotype_file   <- "path/to/info_phenotype_SPARK.xlsx"
+discovery_file   <- "path/to/info_discovery.xlsx"
+replication_file <- "path/to/info_replication.xlsx"
+
+linear_output_file <- "path/to/trio_model_linear_results.xlsx"
+binary_output_file <- "path/to/trio_model_binary_results.xlsx"
+
+prs_set <- c("EA", "CP", "NON_COG")
+pc_cols <- paste0("X", 1:10)
+
+quantitative_phenotypes <- c("scq", "fsiq", "rbsr", "dcdq", "srs", "vabs")
+
+binary_phenotypes <- c(
+  "dev_lang",
+  "mood_or_anx",
+  "attn_behav",
+  "schiz",
+  "sleep_dx"
+)
+
+binary_phenotype_labels <- c(
+  "dev_lang"    = "Developmental",
+  "mood_or_anx" = "Mood",
+  "attn_behav"  = "Behavior",
+  "schiz"       = "Schizophrenia",
+  "sleep_dx"    = "Sleep"
+)
+
+
+# -----------------------------------------------------------------------------
+# 3. Helper functions for data preparation
+# -----------------------------------------------------------------------------
+
+# Combine two data frames while removing duplicated columns from the right table.
+cbind_drop_dup <- function(df_left, df_right) {
+  duplicated_cols <- intersect(colnames(df_left), colnames(df_right))
+  df_right_unique <- df_right[, setdiff(colnames(df_right), duplicated_cols), drop = FALSE]
+  cbind(df_left, df_right_unique)
+}
+
+# Convert variables to numeric when possible.
+to_num <- function(x) {
+  if (is.numeric(x)) return(x)
+  suppressWarnings(as.numeric(x))
+}
+
+# Standardize sex coding and set Female as the reference level when available.
+standardize_sex <- function(dat, sex_var = "sex") {
+  if (!(sex_var %in% names(dat))) {
+    stop(paste0("Missing sex variable: ", sex_var))
+  }
+
+  dat[[sex_var]] <- as.factor(dat[[sex_var]])
+
+  if (all(c("Female", "Male") %in% levels(dat[[sex_var]]))) {
+    dat[[sex_var]] <- factor(dat[[sex_var]], levels = c("Female", "Male"))
+  }
+
+  dat
+}
+
+# Add PGS role labels.
+add_role <- function(df) {
+  df %>%
+    mutate(
+      role = case_when(
+        grepl("^fa_", variable) ~ "Paternal",
+        grepl("^mo_", variable) ~ "Maternal",
+        TRUE ~ "Proband"
+      ),
+      prs_base = gsub("^fa_|^mo_", "", variable)
+    )
+}
+
+
+# -----------------------------------------------------------------------------
+# 4. Read and prepare data
+# -----------------------------------------------------------------------------
+
+info_phe <- read.xlsx(phenotype_file)
+info_D   <- read.xlsx(discovery_file)
+info_R   <- read.xlsx(replication_file)
+
+info_D_phe <- cbind_drop_dup(info_D, info_phe)
+info_R_phe <- cbind_drop_dup(info_R, info_phe)
+
+info_D_phe <- info_D_phe %>% filter(keep == 1)
+info_R_phe <- info_R_phe %>% filter(keep == 1)
+
+info_D_phe_asd <- info_D_phe[info_D_phe$asd == TRUE, ]
+info_R_phe_asd <- info_R_phe[info_R_phe$asd == TRUE, ]
+
+info_D_phe_asd <- standardize_sex(info_D_phe_asd)
+info_R_phe_asd <- standardize_sex(info_R_phe_asd)
+
+
+# -----------------------------------------------------------------------------
+# 5. Multivariable linear models for quantitative phenotypes
+# -----------------------------------------------------------------------------
+
+run_multivariate_linear <- function(data, y_list, x_interest, pc_cols = paste0("X", 1:10)) {
+
+  dat <- as.data.table(data)
+  out <- list()
+
+  # Convert potentially numeric columns imported from Excel as characters.
+  maybe_num <- unique(c(y_list, paste0(y_list, "_age"), x_interest, pc_cols))
+  for (v in intersect(maybe_num, names(dat))) {
+    if (v != "sex") dat[[v]] <- to_num(dat[[v]])
+  }
+
+  # Z-standardize ancestry PCs.
+  for (pc in pc_cols) {
+    if (pc %in% names(dat) && is.numeric(dat[[pc]])) {
+      dat[[paste0(pc, "_z")]] <- as.numeric(scale(dat[[pc]]))
+    }
+  }
+
+  # Z-standardize PGS predictors.
+  x_interest_z <- character(0)
+
+  for (x in x_interest) {
+    if (!(x %in% names(dat))) {
+      warning(paste("Variable not found, skipped:", x))
+      next
+    }
+
+    if (is.numeric(dat[[x]])) {
+      x_z <- paste0(x, "_z")
+      dat[[x_z]] <- as.numeric(scale(dat[[x]]))
+      x_interest_z <- c(x_interest_z, x_z)
+    } else {
+      warning(paste("Non-numeric variable cannot be standardized, skipped:", x))
+    }
+  }
+
+  if (length(x_interest_z) == 0) {
+    stop("No valid numeric variables in x_interest.")
+  }
+
+  # Fit one multivariable model per phenotype.
+  for (y in y_list) {
+
+    if (!(y %in% names(dat))) next
+    if (!is.numeric(dat[[y]])) next
+
+    y_z <- paste0(y, "_z")
+    dat[[y_z]] <- as.numeric(scale(dat[[y]]))
+
+    age_var <- paste0(y, "_age")
+
+    x_use <- c(
+      x_interest_z,
+      "sex",
+      if (age_var %in% names(dat)) age_var else NULL,
+      intersect(paste0(pc_cols, "_z"), names(dat))
+    )
+
+    form <- as.formula(paste0(y_z, " ~ ", paste(x_use, collapse = " + ")))
+
+    fit <- lm(form, data = dat)
+    sm  <- summary(fit)
+    n   <- nobs(fit)
+
+    coef_tab <- as.data.frame(sm$coefficients)
+    coef_tab$variable <- rownames(coef_tab)
+
+    selected <- coef_tab[coef_tab$variable %in% x_interest_z, , drop = FALSE]
+    if (nrow(selected) == 0) next
+
+    selected$variable  <- sub("_z$", "", selected$variable)
+    selected$phenotype <- y
+    selected$R2        <- sm$r.squared
+    selected$n         <- n
+
+    out[[y]] <- selected
+  }
+
+  res <- do.call(rbind, out)
+  rownames(res) <- NULL
+  res
+}
+
+run_trio_linear_all_prs <- function(dat_asd, y_list, prs_set, pc_cols = paste0("X", 1:10)) {
+  all_res <- lapply(prs_set, function(prs) {
+    x_interest <- c(prs, paste0("fa_", prs), paste0("mo_", prs))
+    tmp <- run_multivariate_linear(dat_asd, y_list, x_interest, pc_cols = pc_cols)
+    tmp$PRS <- prs
+    tmp
+  })
+
+  do.call(rbind, all_res)
+}
+
+
+# -----------------------------------------------------------------------------
+# 6. Multivariable logistic models for binary phenotypes
+# -----------------------------------------------------------------------------
+
+run_multivariate_logistic <- function(data, y_list, x_interest,
+                                      age_col = "med_age",
+                                      pc_cols = paste0("X", 1:10)) {
+
+  dat <- as.data.table(data)
+  out <- list()
+
+  if (!("sex" %in% names(dat))) stop("Missing sex variable.")
+  if (!(age_col %in% names(dat))) stop(paste0("Missing age variable: ", age_col))
+
+  dat <- standardize_sex(dat)
+
+  # Convert potentially numeric columns imported from Excel as characters.
+  maybe_num <- unique(c(y_list, x_interest, age_col, pc_cols))
+  for (v in intersect(maybe_num, names(dat))) {
+    if (v != "sex") dat[[v]] <- to_num(dat[[v]])
+  }
+
+  # Z-standardize ancestry PCs.
+  for (pc in pc_cols) {
+    if (pc %in% names(dat) && is.numeric(dat[[pc]])) {
+      dat[[paste0(pc, "_z")]] <- as.numeric(scale(dat[[pc]]))
+    }
+  }
+
+  # Z-standardize PGS predictors.
+  x_interest_z <- character(0)
+
+  for (x in x_interest) {
+    if (!(x %in% names(dat))) {
+      warning(paste("Variable not found, skipped:", x))
+      next
+    }
+
+    if (is.numeric(dat[[x]])) {
+      x_z <- paste0(x, "_z")
+      dat[[x_z]] <- as.numeric(scale(dat[[x]]))
+      x_interest_z <- c(x_interest_z, x_z)
+    } else {
+      warning(paste("Non-numeric variable cannot be standardized, skipped:", x))
+    }
+  }
+
+  if (length(x_interest_z) == 0) {
+    stop("No valid numeric variables in x_interest.")
+  }
+
+  # Fit one multivariable logistic model per binary phenotype.
+  for (y in y_list) {
+
+    if (!(y %in% names(dat))) {
+      warning(paste("Phenotype not found, skipped:", y))
+      next
+    }
+
+    dat[[y]] <- as.numeric(dat[[y]])
+
+    x_use <- c(
+      x_interest_z,
+      "sex",
+      age_col,
+      intersect(paste0(pc_cols, "_z"), names(dat))
+    )
+
+    form <- as.formula(paste0(y, " ~ ", paste(x_use, collapse = " + ")))
+
+    fit <- glm(form, data = dat, family = binomial)
+    sm  <- summary(fit)
+    n   <- nobs(fit)
+
+    coef_tab <- as.data.frame(sm$coefficients)
+    coef_tab$variable <- rownames(coef_tab)
+
+    selected <- coef_tab[coef_tab$variable %in% x_interest_z, , drop = FALSE]
+    if (nrow(selected) == 0) next
+
+    # Odds ratios and 95% confidence intervals.
+    selected$OR       <- exp(selected$Estimate)
+    selected$CI_lower <- exp(selected$Estimate - 1.96 * selected$`Std. Error`)
+    selected$CI_upper <- exp(selected$Estimate + 1.96 * selected$`Std. Error`)
+
+    # McFadden pseudo-R2.
+    null_fit <- glm(as.formula(paste0(y, " ~ 1")), data = dat, family = binomial)
+    selected$R2 <- 1 - as.numeric(logLik(fit) / logLik(null_fit))
+
+    selected$variable  <- sub("_z$", "", selected$variable)
+    selected$phenotype <- y
+    selected$n         <- n
+
+    out[[y]] <- selected
+  }
+
+  res <- do.call(rbind, out)
+  rownames(res) <- NULL
+  res
+}
+
+run_trio_logistic_all_prs <- function(dat_asd, y_list, prs_set,
+                                      age_col = "med_age",
+                                      pc_cols = paste0("X", 1:10)) {
+  all_res <- lapply(prs_set, function(prs) {
+    x_interest <- c(prs, paste0("fa_", prs), paste0("mo_", prs))
+    tmp <- run_multivariate_logistic(
+      dat_asd,
+      y_list,
+      x_interest,
+      age_col = age_col,
+      pc_cols = pc_cols
+    )
+    tmp$PRS <- prs
+    tmp
+  })
+
+  do.call(rbind, all_res)
+}
+
+
+# -----------------------------------------------------------------------------
+# 7. Fixed-effect meta-analysis functions
+# -----------------------------------------------------------------------------
+
+meta_two_studies_FE_linear <- function(res_D, res_R,
+                                       key_cols = c("phenotype", "PRS", "variable"),
+                                       beta_col = "Estimate",
+                                       se_col   = "Std. Error") {
+
+  D <- res_D %>%
+    select(all_of(key_cols), all_of(beta_col), all_of(se_col), n, R2) %>%
+    rename(
+      beta_D = all_of(beta_col),
+      se_D   = all_of(se_col),
+      n_D    = n,
+      R2_D   = R2
+    )
+
+  R <- res_R %>%
+    select(all_of(key_cols), all_of(beta_col), all_of(se_col), n, R2) %>%
+    rename(
+      beta_R = all_of(beta_col),
+      se_R   = all_of(se_col),
+      n_R    = n,
+      R2_R   = R2
+    )
+
+  M <- inner_join(D, R, by = key_cols) %>%
+    filter(
+      is.finite(beta_D), is.finite(beta_R),
+      is.finite(se_D),   is.finite(se_R),
+      se_D > 0, se_R > 0
+    )
+
+  if (nrow(M) == 0) return(M)
+
+  wD <- 1 / (M$se_D^2)
+  wR <- 1 / (M$se_R^2)
+  w  <- wD + wR
+
+  beta_FE <- (wD * M$beta_D + wR * M$beta_R) / w
+  se_FE   <- sqrt(1 / w)
+  z_FE    <- beta_FE / se_FE
+  p_FE    <- 2 * pnorm(-abs(z_FE))
+
+  M %>%
+    mutate(
+      beta_FE = beta_FE,
+      se_FE   = se_FE,
+      z_FE    = z_FE,
+      p_FE    = p_FE
+    )
+}
+
+meta_two_studies_FE_logistic <- function(res_D, res_R,
+                                         key_cols = c("phenotype", "PRS", "role"),
+                                         beta_col = "Estimate",
+                                         se_col   = "Std. Error") {
+
+  D <- res_D %>%
+    select(all_of(key_cols), all_of(beta_col), all_of(se_col), n) %>%
+    rename(
+      beta_D = all_of(beta_col),
+      se_D   = all_of(se_col),
+      n_D    = n
+    )
+
+  R <- res_R %>%
+    select(all_of(key_cols), all_of(beta_col), all_of(se_col), n) %>%
+    rename(
+      beta_R = all_of(beta_col),
+      se_R   = all_of(se_col),
+      n_R    = n
+    )
+
+  M <- inner_join(D, R, by = key_cols) %>%
+    filter(
+      is.finite(beta_D), is.finite(beta_R),
+      is.finite(se_D),   is.finite(se_R),
+      se_D > 0, se_R > 0
+    )
+
+  if (nrow(M) == 0) return(M)
+
+  wD <- 1 / (M$se_D^2)
+  wR <- 1 / (M$se_R^2)
+  w  <- wD + wR
+
+  beta_FE <- (wD * M$beta_D + wR * M$beta_R) / w
+  se_FE   <- sqrt(1 / w)
+  z_FE    <- beta_FE / se_FE
+  p_FE    <- 2 * pnorm(-abs(z_FE))
+
+  M %>%
+    mutate(
+      beta_FE     = beta_FE,
+      se_FE       = se_FE,
+      z_FE        = z_FE,
+      p_FE        = p_FE,
+      OR_FE       = exp(beta_FE),
+      CI_lower_FE = exp(beta_FE - 1.96 * se_FE),
+      CI_upper_FE = exp(beta_FE + 1.96 * se_FE)
+    )
+}
+
+
+# -----------------------------------------------------------------------------
+# 8. Run trio linear models and meta-analysis
+# -----------------------------------------------------------------------------
+
+res_trio_D_linear <- run_trio_linear_all_prs(
+  info_D_phe_asd,
+  quantitative_phenotypes,
+  prs_set,
+  pc_cols = pc_cols
+)
+
+res_trio_R_linear <- run_trio_linear_all_prs(
+  info_R_phe_asd,
+  quantitative_phenotypes,
+  prs_set,
+  pc_cols = pc_cols
+)
+
+meta_trio_linear_FE <- meta_two_studies_FE_linear(
+  res_trio_D_linear,
+  res_trio_R_linear
+)
+
+write.xlsx(meta_trio_linear_FE, linear_output_file)
+
+
+# -----------------------------------------------------------------------------
+# 9. Plot trio linear results
+# -----------------------------------------------------------------------------
+
+plot_trio_linear_forest <- function(meta_linear_FE, prs_set = c("EA", "CP", "NON_COG")) {
+
+  group_data <- meta_linear_FE %>%
+    filter(PRS %in% prs_set) %>%
+    mutate(
+      effect_type = case_when(
+        variable == PRS ~ "Direct (Proband)",
+        grepl("^fa_", variable) ~ "Indirect (Paternal)",
+        grepl("^mo_", variable) ~ "Indirect (Maternal)",
+        TRUE ~ NA_character_
+      ),
+      significance = case_when(
+        p_FE < 0.001 / 18 ~ "***",
+        p_FE < 0.01  / 18 ~ "**",
+        p_FE < 0.05  / 18 ~ "*",
+        TRUE ~ ""
+      ),
+      PRS = factor(as.character(PRS), levels = prs_set),
+      phenotype = factor(
+        toupper(as.character(phenotype)),
+        levels = rev(c("SCQ", "SRS", "RBSR", "FSIQ", "DCDQ", "VABS"))
+      ),
+      ci_lower = beta_FE - 1.96 * se_FE,
+      ci_upper = beta_FE + 1.96 * se_FE
+    ) %>%
+    filter(
+      !is.na(effect_type),
+      !is.na(beta_FE),
+      !is.na(se_FE),
+      !is.na(phenotype),
+      !is.na(PRS)
+    )
+
+  prs_label_expr <- function(prs_name) {
+    switch(
+      as.character(prs_name),
+      "EA" = expression(PGS[EA]),
+      "CP" = expression(PGS[CP]),
+      "NON_COG" = expression(PGS[NON_COG])
+    )
+  }
+
+  create_forest_one_panel <- function(data, prs_name, show_y = FALSE) {
+
+    d <- data %>% filter(PRS == prs_name)
+    pd <- position_dodge(width = 0.55)
+
+    p <- ggplot(
+      d,
+      aes(
+        x = beta_FE,
+        y = phenotype,
+        colour = effect_type,
+        group = effect_type
+      )
+    ) +
+      geom_vline(
+        xintercept = 0,
+        linetype = "dashed",
+        linewidth = 0.3,
+        color = "grey40"
+      ) +
+      geom_errorbarh(
+        aes(xmin = ci_lower, xmax = ci_upper),
+        height = 0.12,
+        linewidth = 0.5,
+        position = pd
+      ) +
+      geom_point(
+        size = 1.8,
+        shape = 16,
+        position = pd
+      ) +
+      geom_text(
+        aes(label = significance),
+        position = pd,
+        vjust = -0.35,
+        hjust = 0.5,
+        color = "black",
+        size = 7 / .pt,
+        fontface = "bold",
+        show.legend = FALSE,
+        na.rm = TRUE
+      ) +
+      scale_color_manual(
+        values = c(
+          "Direct (Proband)" = "#E41A1C",
+          "Indirect (Paternal)" = "#377EB8",
+          "Indirect (Maternal)" = "#4DAF4A"
+        ),
+        name = NULL,
+        breaks = c(
+          "Direct (Proband)",
+          "Indirect (Paternal)",
+          "Indirect (Maternal)"
+        )
+      ) +
+      labs(
+        title = NULL,
+        x = prs_label_expr(prs_name),
+        y = if (show_y) "Phenotype" else NULL
+      ) +
+      coord_cartesian(clip = "off") +
+      theme_classic(base_size = 7) +
+      theme(
+        axis.line = element_line(linewidth = 0.4, color = "black"),
+        axis.ticks = element_line(linewidth = 0.35, color = "black"),
+        axis.ticks.length = unit(1.5, "mm"),
+        axis.text.x = element_text(size = 7, color = "black"),
+        axis.text.y = element_text(size = 7, color = "black"),
+        axis.title.x = element_text(size = 7, color = "black", margin = margin(t = 4)),
+        axis.title.y = element_text(size = 7, color = "black"),
+        plot.title = element_blank(),
+        legend.position = "top",
+        legend.direction = "horizontal",
+        legend.text = element_text(size = 7, color = "black"),
+        legend.title = element_text(size = 7, color = "black"),
+        legend.key.size = unit(0.7, "lines"),
+        plot.margin = margin(5.5, 12, 5.5, 5.5)
+      ) +
+      guides(
+        colour = guide_legend(
+          override.aes = list(shape = 16, size = 2),
+          nrow = 1
+        )
+      )
+
+    if (!show_y) {
+      p <- p +
+        theme(
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.line.y = element_blank()
+        )
+    }
+
+    p
+  }
+
+  p1 <- create_forest_one_panel(group_data, "EA", show_y = TRUE)
+  p2 <- create_forest_one_panel(group_data, "CP", show_y = FALSE)
+  p3 <- create_forest_one_panel(group_data, "NON_COG", show_y = FALSE)
+
+  (p1 + p2 + p3) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "top")
+}
+
+p_trio_linear_forest <- plot_trio_linear_forest(meta_trio_linear_FE, prs_set = prs_set)
+p_trio_linear_forest
+
+
+# -----------------------------------------------------------------------------
+# 10. Run trio logistic models and meta-analysis
+# -----------------------------------------------------------------------------
+
+res_trio_D_logistic <- run_trio_logistic_all_prs(
+  info_D_phe_asd,
+  binary_phenotypes,
+  prs_set,
+  age_col = "med_age",
+  pc_cols = pc_cols
+)
+
+res_trio_R_logistic <- run_trio_logistic_all_prs(
+  info_R_phe_asd,
+  binary_phenotypes,
+  prs_set,
+  age_col = "med_age",
+  pc_cols = pc_cols
+)
+
+res_trio_D_logistic$phenotype_label <- unname(binary_phenotype_labels[res_trio_D_logistic$phenotype])
+res_trio_R_logistic$phenotype_label <- unname(binary_phenotype_labels[res_trio_R_logistic$phenotype])
+
+res_trio_D_logistic <- add_role(res_trio_D_logistic)
+res_trio_R_logistic <- add_role(res_trio_R_logistic)
+
+meta_trio_logistic_FE <- meta_two_studies_FE_logistic(
+  res_trio_D_logistic,
+  res_trio_R_logistic,
+  key_cols = c("phenotype", "PRS", "role")
+)
+
+phenotype_label_map <- res_trio_D_logistic %>%
+  distinct(phenotype, phenotype_label)
+
+meta_trio_logistic_FE <- meta_trio_logistic_FE %>%
+  left_join(phenotype_label_map, by = "phenotype")
+
+meta_trio_logistic_FE2 <- as.data.table(meta_trio_logistic_FE)
+
+meta_trio_logistic_FE2[, p_adj := p.adjust(p_FE, method = "bonferroni", n = 150)]
+meta_trio_logistic_FE2[, sig := fifelse(
+  p_FE < 0.001 / 15, "***",
+  fifelse(
+    p_FE < 0.01 / 15, "**",
+    fifelse(p_FE < 0.05 / 15, "*", "")
+  )
+)]
+
+write.xlsx(meta_trio_logistic_FE2, binary_output_file)
+
+
+# -----------------------------------------------------------------------------
+# 11. Plot trio logistic results
+# -----------------------------------------------------------------------------
+
+plot_trio_logistic_forest <- function(meta_logistic_FE2,
+                                      prs_order = c("EA", "CP", "NON_COG")) {
+
+  data_prepared <- meta_logistic_FE2 %>%
+    mutate(
+      prs = factor(PRS, levels = prs_order),
+      effect_type = case_when(
+        role == "Proband"  ~ "Proband",
+        role == "Paternal" ~ "Paternal",
+        role == "Maternal" ~ "Maternal"
+      ),
+      effect_type = factor(
+        effect_type,
+        levels = c("Proband", "Paternal", "Maternal")
+      ),
+      phenotype_label = case_when(
+        phenotype == "dev_lang"    ~ "Developmental",
+        phenotype == "mood_or_anx" ~ "Mood",
+        phenotype == "attn_behav"  ~ "Behavior",
+        phenotype == "schiz"       ~ "Schizophrenia",
+        phenotype == "sleep_dx"    ~ "Sleep",
+        TRUE ~ as.character(phenotype)
+      ),
+      phenotype_label = factor(
+        phenotype_label,
+        levels = c("Developmental", "Mood", "Behavior", "Schizophrenia", "Sleep")
+      )
+    )
+
+  prs_labels <- c(
+    EA = "PGS[EA]",
+    CP = "PGS[CP]",
+    NON_COG = "PGS[NON_COG]"
+  )
+
+  effect_colors <- c(
+    "Proband"  = "#B85C5C",
+    "Paternal" = "#6487C0",
+    "Maternal" = "#6AA27A"
+  )
+
+  create_single_phenotype_plot <- function(data, pheno,
+                                           show_y_axis = FALSE,
+                                           show_legend = FALSE) {
+
+    plot_data <- data %>%
+      filter(phenotype_label == pheno) %>%
+      arrange(prs, effect_type) %>%
+      mutate(
+        prs = factor(as.character(prs), levels = rev(prs_order)),
+        effect_type = factor(
+          as.character(effect_type),
+          levels = c("Proband", "Paternal", "Maternal")
+        )
+      )
+
+    if (nrow(plot_data) == 0) return(NULL)
+
+    pd <- position_dodge(width = 0.58)
+
+    x_range <- range(c(plot_data$CI_lower_FE, plot_data$CI_upper_FE), na.rm = TRUE)
+    x_padding <- diff(x_range) * 0.15
+
+    ggplot(
+      plot_data,
+      aes(
+        x = OR_FE,
+        y = prs,
+        xmin = CI_lower_FE,
+        xmax = CI_upper_FE,
+        color = effect_type,
+        group = effect_type
+      )
+    ) +
+      geom_vline(
+        xintercept = 1,
+        linetype = "dashed",
+        linewidth = 0.3,
+        color = "#999999"
+      ) +
+      geom_errorbarh(
+        height = 0.14,
+        position = pd,
+        linewidth = 0.4,
+        alpha = 0.9
+      ) +
+      geom_point(
+        size = 1.8,
+        shape = 16,
+        position = pd
+      ) +
+      geom_text(
+        aes(label = sig),
+        position = pd,
+        vjust = -0.35,
+        size = 2.2,
+        fontface = "bold",
+        color = "black",
+        show.legend = FALSE
+      ) +
+      scale_color_manual(
+        values = effect_colors,
+        breaks = c("Proband", "Paternal", "Maternal"),
+        name = NULL,
+        guide = if (show_legend) "legend" else "none"
+      ) +
+      scale_y_discrete(
+        labels = function(x) parse(text = prs_labels[x])
+      ) +
+      scale_x_log10(
+        limits = c(
+          max(0.1, x_range[1] - x_padding),
+          min(10,  x_range[2] + x_padding)
+        ),
+        breaks = function(limits) {
+          if (limits[2] / limits[1] > 100) {
+            c(0.1, 0.5, 1, 2, 5, 10)
+          } else if (limits[2] / limits[1] > 20) {
+            c(0.5, 1, 2, 5)
+          } else if (limits[2] / limits[1] > 10) {
+            c(0.5, 1, 2, 3)
+          } else {
+            pretty(limits, n = 4)
+          }
+        },
+        expand = expansion(mult = c(0.05, 0.05))
+      ) +
+      labs(
+        x = NULL,
+        y = if (show_y_axis) "Polygenic score" else NULL,
+        title = pheno
+      ) +
+      theme_classic(base_size = 7) +
+      theme(
+        axis.line.x = element_line(linewidth = 0.35, color = "black"),
+        axis.line.y = if (show_y_axis) {
+          element_line(linewidth = 0.35, color = "black")
+        } else {
+          element_blank()
+        },
+        axis.ticks.x = element_line(linewidth = 0.3, color = "black"),
+        axis.ticks.y = if (show_y_axis) {
+          element_line(linewidth = 0.3, color = "black")
+        } else {
+          element_blank()
+        },
+        axis.ticks.length = unit(1.5, "mm"),
+        axis.text.x = element_text(size = 7, color = "black"),
+        axis.text.y = if (show_y_axis) {
+          element_text(size = 7, color = "black")
+        } else {
+          element_blank()
+        },
+        axis.title.x = element_text(size = 7, color = "black"),
+        axis.title.y = if (show_y_axis) {
+          element_text(size = 7, color = "black")
+        } else {
+          element_blank()
+        },
+        plot.title = element_text(
+          size = 7,
+          face = "bold",
+          hjust = 0.5,
+          color = "black"
+        ),
+        legend.position = if (show_legend) "right" else "none",
+        legend.title = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        legend.key.size = unit(0.7, "lines"),
+        plot.margin = margin(6, 6, 6, 6)
+      ) +
+      guides(
+        color = guide_legend(
+          override.aes = list(shape = 16, size = 2.2)
+        )
+      )
+  }
+
+  phenotypes <- levels(data_prepared$phenotype_label)
+
+  plot_list <- vector("list", length(phenotypes))
+
+  for (i in seq_along(phenotypes)) {
+    plot_list[[i]] <- create_single_phenotype_plot(
+      data_prepared,
+      phenotypes[i],
+      show_y_axis = (i == 1),
+      show_legend = (i == length(phenotypes))
+    )
+  }
+
+  combined_plots <- wrap_plots(
+    plot_list,
+    nrow = 1,
+    widths = c(1.2, 1, 1, 1, 1.2)
+  )
+
+  combined_plots +
+    plot_annotation(
+      caption = "Odds Ratio",
+      theme = theme(
+        plot.caption = element_text(
+          size = 7,
+          hjust = 0.5,
+          margin = margin(t = 8, b = 4),
+          color = "black"
+        ),
+        plot.margin = margin(5.5, 5.5, 14, 5.5)
+      )
+    )
+}
+
+p_trio_logistic_forest <- plot_trio_logistic_forest(
+  meta_trio_logistic_FE2,
+  prs_order = prs_set
+)
+
+p_trio_logistic_forest
