@@ -1,0 +1,863 @@
+# ============================================================
+# Prenatal Factors and Trio PGS Analysis
+# ============================================================
+#
+# This script evaluates associations between prenatal factors, trio-based
+# polygenic scores (PGSs), and ASD-related phenotypes in discovery and
+# replication cohorts. It includes:
+#   1) Logistic models for prenatal factors as outcomes.
+#   2) Linear trio models for ASD-related quantitative phenotypes.
+#   3) Sensitivity analyses excluding or adjusting for prenatal factors.
+#   4) Interaction analyses between prenatal factors and trio PGSs.
+#   5) Fixed-effect meta-analysis across discovery and replication cohorts.
+#
+# Replace the file paths below with project-specific paths before running.
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(openxlsx)
+  library(dplyr)
+  library(ggplot2)
+  library(patchwork)
+  library(grid)
+})
+
+# ============================================================
+# 1. Input files and output directory
+# ============================================================
+
+phenotype_file   <- "path/to/info_phenotype_SPARK.xlsx"
+discovery_file   <- "path/to/info_discovery.xlsx"
+replication_file <- "path/to/info_replication.xlsx"
+
+output_dir <- "results/prenatal_factors"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ============================================================
+# 2. Load and prepare data
+# ============================================================
+
+info_phe <- read.xlsx(phenotype_file)
+info_D   <- read.xlsx(discovery_file)
+info_R   <- read.xlsx(replication_file)
+
+bind_without_duplicate_columns <- function(df_left, df_right) {
+  duplicated_cols <- intersect(colnames(df_left), colnames(df_right))
+  df_right_unique <- df_right[, setdiff(colnames(df_right), duplicated_cols), drop = FALSE]
+  cbind(df_left, df_right_unique)
+}
+
+info_D_phe <- bind_without_duplicate_columns(info_D, info_phe)
+info_R_phe <- bind_without_duplicate_columns(info_R, info_phe)
+
+info_D_phe <- info_D_phe %>% filter(keep == 1)
+info_R_phe <- info_R_phe %>% filter(keep == 1)
+
+info_D_phe_asd <- info_D_phe %>% filter(asd == TRUE)
+info_R_phe_asd <- info_R_phe %>% filter(asd == TRUE)
+
+info_D_phe_asd$sex <- factor(info_D_phe_asd$sex, levels = c("Female", "Male"))
+info_R_phe_asd$sex <- factor(info_R_phe_asd$sex, levels = c("Female", "Male"))
+
+# ============================================================
+# 3. Analysis settings
+# ============================================================
+
+quantitative_phenotypes <- c("scq", "fsiq", "rbsr", "dcdq", "srs", "vabs")
+
+prenatal_factors <- c(
+  "med_cond_birth",
+  "birth_etoh_subst",
+  "birth_ivh",
+  "birth_oxygen",
+  "birth_pg_inf",
+  "birth_prem"
+)
+
+prs_set <- c("EA", "CP", "NON_COG")
+pc_cols <- paste0("X", 1:10)
+
+# ============================================================
+# 4. Helper functions
+# ============================================================
+
+to_numeric_safely <- function(x) {
+  if (is.numeric(x)) return(x)
+  suppressWarnings(as.numeric(x))
+}
+
+standardize_column <- function(x) {
+  as.numeric(scale(x))
+}
+
+format_sex_variable <- function(dat, sex_col = "sex") {
+  if (!sex_col %in% names(dat)) {
+    stop("Missing sex column: ", sex_col)
+  }
+  dat[[sex_col]] <- as.factor(dat[[sex_col]])
+  if (all(c("Female", "Male") %in% levels(dat[[sex_col]]))) {
+    dat[[sex_col]] <- factor(dat[[sex_col]], levels = c("Female", "Male"))
+  }
+  dat
+}
+
+keep_only_unexposed <- function(x) {
+  if (is.numeric(x)) return(!is.na(x) & x == 0)
+  if (is.logical(x)) return(!is.na(x) & x == FALSE)
+  xx <- trimws(as.character(x))
+  suppressWarnings(nx <- as.numeric(xx))
+  !is.na(nx) & nx == 0
+}
+
+convert_to_binary_strict <- function(x) {
+  if (is.numeric(x)) return(ifelse(x %in% c(0, 1), x, NA_real_))
+  if (is.logical(x)) return(ifelse(is.na(x), NA_real_, ifelse(x, 1, 0)))
+  xx <- trimws(as.character(x))
+  suppressWarnings(nx <- as.numeric(xx))
+  ifelse(nx %in% c(0, 1), nx, NA_real_)
+}
+
+get_trio_prs_terms <- function(prs) {
+  c(prs, paste0("fa_", prs), paste0("mo_", prs))
+}
+
+add_trio_role <- function(df) {
+  df %>%
+    mutate(
+      role = case_when(
+        grepl("^fa_", variable) ~ "Paternal",
+        grepl("^mo_", variable) ~ "Maternal",
+        TRUE ~ "Proband"
+      ),
+      prs_base = gsub("^fa_|^mo_", "", variable)
+    )
+}
+
+# ============================================================
+# 5. Fixed-effect meta-analysis functions
+# ============================================================
+
+meta_two_studies_linear <- function(res_D, res_R,
+                                    key_cols,
+                                    beta_col = "Estimate",
+                                    se_col = "Std. Error") {
+  D <- res_D %>%
+    select(all_of(key_cols), all_of(beta_col), all_of(se_col), n, R2) %>%
+    rename(beta_D = all_of(beta_col), se_D = all_of(se_col), n_D = n, R2_D = R2)
+
+  R <- res_R %>%
+    select(all_of(key_cols), all_of(beta_col), all_of(se_col), n, R2) %>%
+    rename(beta_R = all_of(beta_col), se_R = all_of(se_col), n_R = n, R2_R = R2)
+
+  M <- inner_join(D, R, by = key_cols) %>%
+    filter(
+      is.finite(beta_D), is.finite(beta_R),
+      is.finite(se_D), is.finite(se_R),
+      se_D > 0, se_R > 0
+    )
+
+  if (nrow(M) == 0) return(M)
+
+  wD <- 1 / (M$se_D^2)
+  wR <- 1 / (M$se_R^2)
+  w  <- wD + wR
+
+  beta_FE <- (wD * M$beta_D + wR * M$beta_R) / w
+  se_FE   <- sqrt(1 / w)
+  z_FE    <- beta_FE / se_FE
+  p_FE    <- 2 * pnorm(-abs(z_FE))
+
+  M %>%
+    mutate(
+      beta_FE = beta_FE,
+      se_FE = se_FE,
+      z_FE = z_FE,
+      p_FE = p_FE
+    )
+}
+
+meta_two_studies_logistic <- function(res_D, res_R,
+                                      key_cols,
+                                      beta_col = "Estimate",
+                                      se_col = "Std. Error") {
+  M <- meta_two_studies_linear(res_D, res_R, key_cols, beta_col, se_col)
+  if (nrow(M) == 0) return(M)
+
+  M %>%
+    mutate(
+      OR_FE = exp(beta_FE),
+      CI_lower_FE = exp(beta_FE - 1.96 * se_FE),
+      CI_upper_FE = exp(beta_FE + 1.96 * se_FE)
+    )
+}
+
+# ============================================================
+# 6. Logistic models: prenatal factors as outcomes
+# ============================================================
+
+run_univariate_prs_logistic <- function(data, Y_list, X_interest,
+                                        age_col = "med_age",
+                                        pc_cols = paste0("X", 1:10)) {
+  dat <- as.data.table(data)
+  dat <- format_sex_variable(dat)
+
+  numeric_cols <- unique(c(Y_list, X_interest, age_col, pc_cols))
+  for (v in intersect(numeric_cols, names(dat))) {
+    if (v != "sex") dat[[v]] <- to_numeric_safely(dat[[v]])
+  }
+
+  for (x in X_interest) {
+    if (x %in% names(dat) && is.numeric(dat[[x]])) {
+      dat[[paste0(x, "_z")]] <- standardize_column(dat[[x]])
+    }
+  }
+
+  for (pc in pc_cols) {
+    if (pc %in% names(dat) && is.numeric(dat[[pc]])) {
+      dat[[paste0(pc, "_z")]] <- standardize_column(dat[[pc]])
+    }
+  }
+
+  out <- list()
+
+  for (y in Y_list) {
+    if (!y %in% names(dat)) next
+    dat[[y]] <- as.numeric(dat[[y]])
+
+    for (x in X_interest) {
+      x_z <- paste0(x, "_z")
+      if (!x_z %in% names(dat)) next
+
+      model_terms <- c(
+        x_z,
+        "sex",
+        age_col,
+        intersect(paste0(pc_cols, "_z"), names(dat))
+      )
+
+      model_formula <- as.formula(paste0(y, " ~ ", paste(model_terms, collapse = " + ")))
+      fit <- glm(model_formula, data = dat, family = binomial)
+      sm  <- summary(fit)
+
+      coef_tab <- as.data.frame(sm$coefficients)
+      if (!x_z %in% rownames(coef_tab)) next
+
+      row <- coef_tab[x_z, , drop = FALSE]
+      row$OR       <- exp(row$Estimate)
+      row$CI_lower <- exp(row$Estimate - 1.96 * row$`Std. Error`)
+      row$CI_upper <- exp(row$Estimate + 1.96 * row$`Std. Error`)
+      row$n        <- nobs(fit)
+
+      null_fit <- glm(as.formula(paste0(y, " ~ 1")), data = dat, family = binomial)
+      row$R2 <- 1 - as.numeric(logLik(fit) / logLik(null_fit))
+
+      row$variable  <- x
+      row$phenotype <- y
+      out[[paste(y, x, sep = "_")]] <- row
+    }
+  }
+
+  res <- do.call(rbind, out)
+  rownames(res) <- NULL
+  res
+}
+
+trio_prs_variables <- unique(unlist(lapply(prs_set, get_trio_prs_terms)))
+
+res_prenatal_D <- run_univariate_prs_logistic(
+  info_D_phe_asd,
+  prenatal_factors,
+  trio_prs_variables
+)
+
+res_prenatal_R <- run_univariate_prs_logistic(
+  info_R_phe_asd,
+  prenatal_factors,
+  trio_prs_variables
+)
+
+meta_prenatal_FE <- meta_two_studies_logistic(
+  res_prenatal_D,
+  res_prenatal_R,
+  key_cols = c("phenotype", "variable")
+) %>%
+  add_trio_role()
+
+write.xlsx(
+  meta_prenatal_FE,
+  file.path(output_dir, "prenatal_factor_prs_logistic_meta.xlsx")
+)
+
+# ============================================================
+# 7. Linear trio model for quantitative phenotypes
+# ============================================================
+
+run_multivariate_trio_linear <- function(data, Y_list, X_interest,
+                                         prenatal_covariate = NULL,
+                                         pc_cols = paste0("X", 1:10)) {
+  dat <- as.data.table(data)
+  dat <- format_sex_variable(dat)
+
+  if (!is.null(prenatal_covariate)) {
+    if (!prenatal_covariate %in% names(dat)) {
+      warning("Prenatal covariate not found and will be ignored: ", prenatal_covariate)
+      prenatal_covariate <- NULL
+    } else {
+      dat[[prenatal_covariate]] <- convert_to_binary_strict(dat[[prenatal_covariate]])
+    }
+  }
+
+  numeric_cols <- unique(c(
+    Y_list,
+    paste0(Y_list, "_age"),
+    X_interest,
+    pc_cols,
+    prenatal_covariate
+  ))
+
+  for (v in intersect(numeric_cols, names(dat))) {
+    if (v != "sex") dat[[v]] <- to_numeric_safely(dat[[v]])
+  }
+
+  for (pc in pc_cols) {
+    if (pc %in% names(dat) && is.numeric(dat[[pc]])) {
+      dat[[paste0(pc, "_z")]] <- standardize_column(dat[[pc]])
+    }
+  }
+
+  X_interest_z <- character(0)
+  for (x in X_interest) {
+    if (!x %in% names(dat)) {
+      warning("Variable not found and skipped: ", x)
+      next
+    }
+    if (is.numeric(dat[[x]])) {
+      x_z <- paste0(x, "_z")
+      dat[[x_z]] <- standardize_column(dat[[x]])
+      X_interest_z <- c(X_interest_z, x_z)
+    } else {
+      warning("Non-numeric variable skipped: ", x)
+    }
+  }
+
+  if (length(X_interest_z) == 0) {
+    stop("No valid numeric predictors found in X_interest.")
+  }
+
+  out <- list()
+
+  for (y in Y_list) {
+    if (!y %in% names(dat)) next
+    if (!is.numeric(dat[[y]])) next
+
+    y_z <- paste0(y, "_z")
+    dat[[y_z]] <- standardize_column(dat[[y]])
+    age_var <- paste0(y, "_age")
+
+    model_terms <- c(
+      X_interest_z,
+      "sex",
+      prenatal_covariate,
+      if (age_var %in% names(dat)) age_var else NULL,
+      intersect(paste0(pc_cols, "_z"), names(dat))
+    )
+
+    model_formula <- as.formula(paste0(y_z, " ~ ", paste(model_terms, collapse = " + ")))
+    fit <- lm(model_formula, data = dat)
+    sm  <- summary(fit)
+
+    coef_tab <- as.data.frame(sm$coefficients)
+    coef_tab$variable <- rownames(coef_tab)
+
+    selected <- coef_tab[coef_tab$variable %in% X_interest_z, , drop = FALSE]
+    if (nrow(selected) == 0) next
+
+    selected$variable  <- sub("_z$", "", selected$variable)
+    selected$phenotype <- y
+    selected$R2        <- sm$r.squared
+    selected$n         <- nobs(fit)
+
+    out[[y]] <- selected
+  }
+
+  res <- do.call(rbind, out)
+  rownames(res) <- NULL
+  res
+}
+
+run_trio_linear_all_prs <- function(data, prs_set, Y_list,
+                                    prenatal_covariate = NULL) {
+  all_results <- lapply(prs_set, function(prs) {
+    X_interest <- get_trio_prs_terms(prs)
+    tmp <- run_multivariate_trio_linear(
+      data,
+      Y_list,
+      X_interest,
+      prenatal_covariate = prenatal_covariate
+    )
+    tmp$PRS <- prs
+    tmp
+  })
+  do.call(rbind, all_results)
+}
+
+# Baseline model without prenatal adjustment
+res_linear_D_base <- run_trio_linear_all_prs(
+  info_D_phe_asd,
+  prs_set,
+  quantitative_phenotypes
+)
+
+res_linear_R_base <- run_trio_linear_all_prs(
+  info_R_phe_asd,
+  prs_set,
+  quantitative_phenotypes
+)
+
+res_linear_D_base$prenatal_factor <- "none"
+res_linear_R_base$prenatal_factor <- "none"
+res_linear_D_base$strategy <- "baseline"
+res_linear_R_base$strategy <- "baseline"
+
+meta_linear_base <- meta_two_studies_linear(
+  res_linear_D_base,
+  res_linear_R_base,
+  key_cols = c("prenatal_factor", "strategy", "phenotype", "PRS", "variable")
+)
+
+# ============================================================
+# 8. Sensitivity analyses for prenatal factors
+# ============================================================
+
+run_exclusion_sensitivity <- function(data, prenatal_factor, prs_set, Y_list) {
+  if (!prenatal_factor %in% names(data)) {
+    warning("Prenatal factor not found and skipped: ", prenatal_factor)
+    return(NULL)
+  }
+
+  dat_filtered <- data[keep_only_unexposed(data[[prenatal_factor]]), , drop = FALSE]
+
+  res <- run_trio_linear_all_prs(dat_filtered, prs_set, Y_list)
+  if (is.null(res) || nrow(res) == 0) return(NULL)
+
+  res$prenatal_factor <- prenatal_factor
+  res$strategy <- "exclude_exposed"
+  res$N_after_filter <- nrow(dat_filtered)
+  res
+}
+
+run_covariate_sensitivity <- function(data, prenatal_factor, prs_set, Y_list) {
+  if (!prenatal_factor %in% names(data)) {
+    warning("Prenatal factor not found and skipped: ", prenatal_factor)
+    return(NULL)
+  }
+
+  res <- run_trio_linear_all_prs(
+    data,
+    prs_set,
+    Y_list,
+    prenatal_covariate = prenatal_factor
+  )
+
+  if (is.null(res) || nrow(res) == 0) return(NULL)
+
+  res$prenatal_factor <- prenatal_factor
+  res$strategy <- "adjust_prenatal_covariate"
+  res$N_used <- nrow(data)
+  res
+}
+
+res_D_exclusion <- do.call(rbind, lapply(
+  prenatal_factors,
+  run_exclusion_sensitivity,
+  data = info_D_phe_asd,
+  prs_set = prs_set,
+  Y_list = quantitative_phenotypes
+))
+
+res_R_exclusion <- do.call(rbind, lapply(
+  prenatal_factors,
+  run_exclusion_sensitivity,
+  data = info_R_phe_asd,
+  prs_set = prs_set,
+  Y_list = quantitative_phenotypes
+))
+
+res_D_covariate <- do.call(rbind, lapply(
+  prenatal_factors,
+  run_covariate_sensitivity,
+  data = info_D_phe_asd,
+  prs_set = prs_set,
+  Y_list = quantitative_phenotypes
+))
+
+res_R_covariate <- do.call(rbind, lapply(
+  prenatal_factors,
+  run_covariate_sensitivity,
+  data = info_R_phe_asd,
+  prs_set = prs_set,
+  Y_list = quantitative_phenotypes
+))
+
+meta_linear_exclusion <- meta_two_studies_linear(
+  res_D_exclusion,
+  res_R_exclusion,
+  key_cols = c("prenatal_factor", "strategy", "phenotype", "PRS", "variable")
+)
+
+meta_linear_covariate <- meta_two_studies_linear(
+  res_D_covariate,
+  res_R_covariate,
+  key_cols = c("prenatal_factor", "strategy", "phenotype", "PRS", "variable")
+)
+
+meta_linear_all <- bind_rows(
+  meta_linear_base,
+  meta_linear_exclusion,
+  meta_linear_covariate
+)
+
+write.xlsx(
+  meta_linear_all,
+  file.path(output_dir, "prenatal_factor_sensitivity_linear_meta.xlsx")
+)
+
+# ============================================================
+# 9. Compare sensitivity results against baseline
+# ============================================================
+
+compare_to_baseline <- function(meta_all,
+                                baseline_strategy = "baseline",
+                                compare_strategies = c("exclude_exposed", "adjust_prenatal_covariate"),
+                                alpha = 0.05,
+                                id_cols = c("phenotype", "PRS", "variable")) {
+  baseline <- meta_all %>%
+    filter(prenatal_factor == "none", strategy == baseline_strategy) %>%
+    select(all_of(id_cols), beta0 = beta_FE, se0 = se_FE, p0 = p_FE)
+
+  comparison <- meta_all %>%
+    filter(prenatal_factor != "none", strategy %in% compare_strategies) %>%
+    select(prenatal_factor, strategy, all_of(id_cols),
+           beta1 = beta_FE, se1 = se_FE, p1 = p_FE,
+           n_D, n_R)
+
+  comparison %>%
+    left_join(baseline, by = id_cols) %>%
+    mutate(
+      delta_beta = beta1 - beta0,
+      se_diff = sqrt(se1^2 + se0^2),
+      z_diff = delta_beta / se_diff,
+      p_diff = 2 * pnorm(-abs(z_diff)),
+      significant_baseline = p0 < alpha,
+      significant_sensitivity = p1 < alpha,
+      direction_flip = sign(beta1) != sign(beta0),
+      significance_flip = significant_baseline != significant_sensitivity,
+      cross_zero = beta0 * beta1 < 0,
+      abs_delta_beta = abs(delta_beta),
+      relative_change = abs_delta_beta / (abs(beta0) + 1e-12)
+    ) %>%
+    arrange(desc(abs_delta_beta))
+}
+
+meta_shift <- compare_to_baseline(meta_linear_all)
+
+write.xlsx(
+  meta_shift,
+  file.path(output_dir, "prenatal_factor_sensitivity_shift_summary.xlsx")
+)
+
+# ============================================================
+# 10. Interaction models: prenatal factor × trio PGS
+# ============================================================
+
+run_trio_interaction_models <- function(data, Y_list, prs_set, prenatal_factor,
+                                        pc_cols = paste0("X", 1:10)) {
+  dat <- as.data.table(data)
+  dat <- format_sex_variable(dat)
+
+  if (!prenatal_factor %in% names(dat)) {
+    stop("Prenatal factor not found: ", prenatal_factor)
+  }
+
+  dat$prenatal_binary <- convert_to_binary_strict(dat[[prenatal_factor]])
+
+  for (pc in pc_cols) {
+    if (pc %in% names(dat)) {
+      dat[[pc]] <- to_numeric_safely(dat[[pc]])
+      if (is.numeric(dat[[pc]])) {
+        dat[[paste0(pc, "_z")]] <- standardize_column(dat[[pc]])
+      }
+    }
+  }
+
+  pc_z <- intersect(paste0(pc_cols, "_z"), names(dat))
+  out <- list()
+
+  for (prs in prs_set) {
+    prs_terms <- get_trio_prs_terms(prs)
+
+    if (!all(prs_terms %in% names(dat))) {
+      warning("Missing trio PGS columns for: ", prs)
+      next
+    }
+
+    for (v in prs_terms) {
+      dat[[v]] <- to_numeric_safely(dat[[v]])
+      if (is.numeric(dat[[v]])) {
+        dat[[paste0(v, "_z")]] <- standardize_column(dat[[v]])
+      }
+    }
+
+    prs_z <- paste0(prs_terms, "_z")
+    interaction_terms <- paste0(prs_z, ":prenatal_binary")
+
+    for (y in Y_list) {
+      if (!y %in% names(dat)) next
+      dat[[y]] <- to_numeric_safely(dat[[y]])
+      if (!is.numeric(dat[[y]])) next
+
+      y_z <- paste0(y, "_z")
+      dat[[y_z]] <- standardize_column(dat[[y]])
+
+      age_var <- paste0(y, "_age")
+      if (age_var %in% names(dat)) {
+        dat[[age_var]] <- to_numeric_safely(dat[[age_var]])
+      }
+
+      model_terms <- c(
+        prs_z,
+        "prenatal_binary",
+        interaction_terms,
+        "sex",
+        if (age_var %in% names(dat)) age_var else NULL,
+        pc_z
+      )
+
+      model_formula <- as.formula(paste0(y_z, " ~ ", paste(model_terms, collapse = " + ")))
+      fit <- lm(model_formula, data = dat)
+      sm  <- summary(fit)
+
+      coef_tab <- as.data.frame(sm$coefficients)
+      coef_tab$term <- rownames(coef_tab)
+
+      selected <- coef_tab[coef_tab$term %in% interaction_terms, , drop = FALSE]
+      if (nrow(selected) == 0) next
+
+      selected$phenotype <- y
+      selected$PRS <- prs
+      selected$prenatal_factor <- prenatal_factor
+      selected$n <- nobs(fit)
+      selected$R2 <- sm$r.squared
+      selected$role <- case_when(
+        selected$term == interaction_terms[1] ~ "Proband",
+        selected$term == interaction_terms[2] ~ "Paternal",
+        selected$term == interaction_terms[3] ~ "Maternal",
+        TRUE ~ NA_character_
+      )
+
+      out[[paste(prs, y, prenatal_factor, sep = "|")]] <- selected
+    }
+  }
+
+  res <- do.call(rbind, out)
+  rownames(res) <- NULL
+  res
+}
+
+res_interaction_D <- do.call(rbind, lapply(
+  prenatal_factors,
+  function(pf) run_trio_interaction_models(
+    info_D_phe_asd,
+    quantitative_phenotypes,
+    prs_set,
+    prenatal_factor = pf
+  )
+))
+res_interaction_D$study <- "Discovery"
+
+res_interaction_R <- do.call(rbind, lapply(
+  prenatal_factors,
+  function(pf) run_trio_interaction_models(
+    info_R_phe_asd,
+    quantitative_phenotypes,
+    prs_set,
+    prenatal_factor = pf
+  )
+))
+res_interaction_R$study <- "Replication"
+
+meta_interaction_FE <- meta_two_studies_linear(
+  res_interaction_D,
+  res_interaction_R,
+  key_cols = c("prenatal_factor", "PRS", "phenotype", "role", "term")
+) %>%
+  mutate(p_FDR = p.adjust(p_FE, method = "fdr"))
+
+write.xlsx(
+  meta_interaction_FE,
+  file.path(output_dir, "prenatal_factor_interaction_meta.xlsx")
+)
+
+# ============================================================
+# 11. Plotting functions
+# ============================================================
+
+plot_prenatal_factor_forest <- function(meta_data,
+                                        target_phenotype = "med_cond_birth",
+                                        prs_order = c("EA", "CP", "NON_COG")) {
+  plot_data <- meta_data %>%
+    filter(phenotype == target_phenotype) %>%
+    mutate(
+      prs_base = gsub("^fa_|^mo_", "", variable),
+      role = case_when(
+        grepl("^fa_", variable) ~ "Paternal",
+        grepl("^mo_", variable) ~ "Maternal",
+        TRUE ~ "Proband"
+      ),
+      prs_base = factor(prs_base, levels = prs_order),
+      role = factor(role, levels = c("Proband", "Paternal", "Maternal")),
+      significance = case_when(
+        p_FE < 0.001 / 18 ~ "***",
+        p_FE < 0.01 / 18  ~ "**",
+        p_FE < 0.05 / 18  ~ "*",
+        TRUE ~ ""
+      )
+    )
+
+  ggplot(plot_data, aes(x = OR_FE, y = prs_base, color = role, group = role)) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "gray50", linewidth = 0.4) +
+    geom_errorbarh(
+      aes(xmin = CI_lower_FE, xmax = CI_upper_FE),
+      height = 0.15,
+      linewidth = 0.5,
+      position = position_dodge(width = 0.45)
+    ) +
+    geom_point(size = 1.8, position = position_dodge(width = 0.45)) +
+    geom_text(
+      aes(label = significance),
+      position = position_dodge(width = 0.45),
+      vjust = -0.35,
+      size = 7 / ggplot2::.pt,
+      color = "black",
+      fontface = "bold",
+      show.legend = FALSE
+    ) +
+    scale_x_log10(name = "Odds Ratio") +
+    scale_y_discrete(
+      name = "Polygenic score",
+      labels = c(
+        EA = expression(PGS[EA]),
+        CP = expression(PGS[CP]),
+        NON_COG = expression(PGS[NON_COG])
+      )
+    ) +
+    scale_color_manual(
+      values = c(
+        Proband = "#B85C5C",
+        Paternal = "#6487C0",
+        Maternal = "#6AA27A"
+      ),
+      name = NULL
+    ) +
+    facet_wrap(~ role, nrow = 1) +
+    theme_bw(base_size = 7) +
+    theme(
+      panel.grid = element_blank(),
+      legend.position = "none",
+      axis.text = element_text(color = "black", size = 7),
+      axis.title = element_text(size = 7),
+      strip.text = element_text(face = "bold", size = 7),
+      strip.background = element_rect(fill = "gray90", color = NA)
+    )
+}
+
+plot_sensitivity_comparison <- function(meta_data,
+                                        prs_name,
+                                        phenotype_name,
+                                        prenatal_factor = "med_cond_birth") {
+  plot_data <- meta_data %>%
+    filter(
+      (
+        prenatal_factor == "none" & strategy == "baseline" |
+          prenatal_factor == !!prenatal_factor &
+            strategy %in% c("adjust_prenatal_covariate", "exclude_exposed")
+      ),
+      variable %in% get_trio_prs_terms(prs_name),
+      phenotype == phenotype_name
+    ) %>%
+    mutate(
+      strategy_group = case_when(
+        strategy == "baseline" ~ "Baseline",
+        strategy == "adjust_prenatal_covariate" ~ "Adjusted",
+        strategy == "exclude_exposed" ~ "Excluded"
+      ),
+      strategy_group = factor(strategy_group, levels = c("Baseline", "Adjusted", "Excluded")),
+      role = case_when(
+        variable == prs_name ~ "Direct (Proband)",
+        variable == paste0("fa_", prs_name) ~ "Indirect (Paternal)",
+        variable == paste0("mo_", prs_name) ~ "Indirect (Maternal)"
+      ),
+      role = factor(role, levels = c("Direct (Proband)", "Indirect (Paternal)", "Indirect (Maternal)")),
+      ci_lower = beta_FE - 1.96 * se_FE,
+      ci_upper = beta_FE + 1.96 * se_FE,
+      significance = case_when(
+        p_FE < 0.001 / 18 ~ "***",
+        p_FE < 0.01 / 18  ~ "**",
+        p_FE < 0.05 / 18  ~ "*",
+        TRUE ~ ""
+      )
+    )
+
+  ggplot(plot_data, aes(x = strategy_group, y = beta_FE, color = role, group = role)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.35) +
+    geom_errorbar(
+      aes(ymin = ci_lower, ymax = ci_upper),
+      width = 0.18,
+      linewidth = 0.45,
+      position = position_dodge(width = 0.6)
+    ) +
+    geom_point(size = 1.8, position = position_dodge(width = 0.6)) +
+    geom_text(
+      aes(y = ci_upper, label = significance),
+      position = position_dodge(width = 0.6),
+      vjust = -0.35,
+      size = 7 / ggplot2::.pt,
+      color = "black",
+      fontface = "bold",
+      show.legend = FALSE
+    ) +
+    scale_color_manual(
+      values = c(
+        "Direct (Proband)" = "#3B6FB6",
+        "Indirect (Paternal)" = "#E07B39",
+        "Indirect (Maternal)" = "#9C6FB6"
+      ),
+      name = NULL
+    ) +
+    labs(x = NULL, y = "Effect size") +
+    theme_classic(base_size = 7) +
+    theme(
+      legend.position = "bottom",
+      axis.text = element_text(color = "black", size = 7),
+      axis.title = element_text(size = 7)
+    )
+}
+
+# ============================================================
+# 12. Example plots
+# ============================================================
+
+p_prenatal_forest <- plot_prenatal_factor_forest(
+  meta_prenatal_FE,
+  target_phenotype = "med_cond_birth"
+)
+
+p_sensitivity_EA_SCQ <- plot_sensitivity_comparison(
+  meta_linear_all,
+  prs_name = "EA",
+  phenotype_name = "scq",
+  prenatal_factor = "med_cond_birth"
+)
+
+print(p_prenatal_forest)
+print(p_sensitivity_EA_SCQ)
