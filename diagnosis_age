@@ -1,0 +1,529 @@
+# Description:
+# This script evaluates associations between offspring and parental polygenic scores (PGSs)
+# and age at ASD diagnosis, combines discovery and replication results using fixed-effect
+# meta-analysis, and performs SEM-based mediation analyses using ASD-related phenotypes as mediators.
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(openxlsx)
+  library(dplyr)
+  library(ggplot2)
+  library(patchwork)
+  library(lavaan)
+  library(purrr)
+  library(grid)
+})
+
+# =============================================================================
+# 1. Configuration
+# =============================================================================
+
+input_dir <- "path/to/input_files"
+output_dir <- "path/to/output_files"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+phenotype_file <- file.path(input_dir, "info_phenotype_SPARK.xlsx")
+discovery_file <- file.path(input_dir, "info_discovery.xlsx")
+replication_file <- file.path(input_dir, "info_replication.xlsx")
+
+prs_set <- c("EA", "CP", "NON_COG")
+prs_variables <- c(prs_set, paste0("fa_", prs_set), paste0("mo_", prs_set))
+pc_n <- 10
+outcome_dx <- "diagnosis_age"
+mediators <- c("scq", "srs", "rbsr", "vabs", "fsiq")
+
+# =============================================================================
+# 2. Data loading and preprocessing
+# =============================================================================
+
+merge_without_duplicate_columns <- function(df_left, df_right) {
+  duplicate_cols <- intersect(colnames(df_left), colnames(df_right))
+  df_right_unique <- df_right[, setdiff(colnames(df_right), duplicate_cols), drop = FALSE]
+  cbind(df_left, df_right_unique)
+}
+
+prepare_asd_data <- function(phenotype_file, discovery_file, replication_file) {
+  info_phe <- read.xlsx(phenotype_file)
+  info_D <- read.xlsx(discovery_file)
+  info_R <- read.xlsx(replication_file)
+
+  info_D_phe <- merge_without_duplicate_columns(info_D, info_phe) %>%
+    filter(keep == 1, asd == TRUE)
+  info_R_phe <- merge_without_duplicate_columns(info_R, info_phe) %>%
+    filter(keep == 1, asd == TRUE)
+
+  info_D_phe$sex <- factor(info_D_phe$sex, levels = c("Female", "Male"))
+  info_R_phe$sex <- factor(info_R_phe$sex, levels = c("Female", "Male"))
+
+  list(discovery = info_D_phe, replication = info_R_phe)
+}
+
+to_numeric_if_possible <- function(x) {
+  if (is.numeric(x)) return(x)
+  suppressWarnings(as.numeric(x))
+}
+
+standardize_column <- function(x) {
+  as.numeric(scale(x))
+}
+
+# =============================================================================
+# 3. Linear association models for diagnosis age
+# =============================================================================
+
+get_pc_cols_for_variable <- function(variable, pc_n = 10) {
+  if (grepl("^fa_", variable)) {
+    paste0("fa_X", seq_len(pc_n))
+  } else if (grepl("^mo_", variable)) {
+    paste0("mo_X", seq_len(pc_n))
+  } else {
+    paste0("X", seq_len(pc_n))
+  }
+}
+
+run_single_predictor_linear_models <- function(data, outcomes, predictors, pc_n = 10,
+                                               sex_var = "sex") {
+  dat <- as.data.table(data)
+  out <- list()
+
+  if (!sex_var %in% names(dat)) stop("Missing sex variable: ", sex_var)
+  dat[[sex_var]] <- factor(dat[[sex_var]])
+  if (all(c("Female", "Male") %in% levels(dat[[sex_var]]))) {
+    dat[[sex_var]] <- factor(dat[[sex_var]], levels = c("Female", "Male"))
+  }
+
+  all_pc_cols <- unique(unlist(lapply(predictors, get_pc_cols_for_variable, pc_n = pc_n)))
+  numeric_candidates <- unique(c(outcomes, paste0(outcomes, "_age"), predictors, all_pc_cols))
+
+  for (col in intersect(numeric_candidates, names(dat))) {
+    if (col != sex_var) dat[[col]] <- to_numeric_if_possible(dat[[col]])
+  }
+
+  for (x in predictors) {
+    if (x %in% names(dat) && is.numeric(dat[[x]])) {
+      dat[[paste0(x, "_z")]] <- standardize_column(dat[[x]])
+    }
+  }
+
+  for (pc in all_pc_cols) {
+    if (pc %in% names(dat) && is.numeric(dat[[pc]])) {
+      dat[[paste0(pc, "_z")]] <- standardize_column(dat[[pc]])
+    }
+  }
+
+  for (y in outcomes) {
+    if (!y %in% names(dat) || !is.numeric(dat[[y]])) next
+    y_z <- paste0(y, "_z")
+    dat[[y_z]] <- standardize_column(dat[[y]])
+    age_var <- paste0(y, "_age")
+
+    for (x in predictors) {
+      x_z <- paste0(x, "_z")
+      if (!x_z %in% names(dat)) next
+
+      pc_z <- intersect(paste0(get_pc_cols_for_variable(x, pc_n), "_z"), names(dat))
+      model_terms <- c(x_z, sex_var, if (age_var %in% names(dat)) age_var else NULL, pc_z)
+      fit <- lm(as.formula(paste0(y_z, " ~ ", paste(model_terms, collapse = " + "))), data = dat)
+      sm <- summary(fit)
+      coef_tab <- as.data.frame(sm$coefficients)
+      if (!x_z %in% rownames(coef_tab)) next
+
+      row <- coef_tab[x_z, , drop = FALSE]
+      row$n <- nobs(fit)
+      row$variable <- x
+      row$phenotype <- y
+      row$R2 <- sm$r.squared
+      out[[paste(y, x, sep = "_")]] <- row
+    }
+  }
+
+  res <- do.call(rbind, out)
+  rownames(res) <- NULL
+  res %>% rename(beta = Estimate, se = `Std. Error`, t = `t value`, p = `Pr(>|t|)`)
+}
+
+run_trio_linear_models <- function(data, outcomes, prs_set, pc_n = 10, sex_var = "sex") {
+  dat <- as.data.table(data)
+  out <- list()
+
+  pc_cols <- paste0("X", seq_len(pc_n))
+  numeric_candidates <- unique(c(outcomes, paste0(outcomes, "_age"), prs_set,
+                                 paste0("fa_", prs_set), paste0("mo_", prs_set), pc_cols))
+  for (col in intersect(numeric_candidates, names(dat))) {
+    if (col != sex_var) dat[[col]] <- to_numeric_if_possible(dat[[col]])
+  }
+
+  for (pc in pc_cols) {
+    if (pc %in% names(dat) && is.numeric(dat[[pc]])) dat[[paste0(pc, "_z")]] <- standardize_column(dat[[pc]])
+  }
+
+  for (prs in prs_set) {
+    predictors <- c(prs, paste0("fa_", prs), paste0("mo_", prs))
+    predictor_z <- character(0)
+
+    for (x in predictors) {
+      if (x %in% names(dat) && is.numeric(dat[[x]])) {
+        dat[[paste0(x, "_z")]] <- standardize_column(dat[[x]])
+        predictor_z <- c(predictor_z, paste0(x, "_z"))
+      }
+    }
+    if (length(predictor_z) == 0) next
+
+    for (y in outcomes) {
+      if (!y %in% names(dat) || !is.numeric(dat[[y]])) next
+      y_z <- paste0(y, "_z")
+      dat[[y_z]] <- standardize_column(dat[[y]])
+      age_var <- paste0(y, "_age")
+      model_terms <- c(predictor_z, sex_var, if (age_var %in% names(dat)) age_var else NULL,
+                       intersect(paste0(pc_cols, "_z"), names(dat)))
+      fit <- lm(as.formula(paste0(y_z, " ~ ", paste(model_terms, collapse = " + "))), data = dat)
+      sm <- summary(fit)
+      coef_tab <- as.data.frame(sm$coefficients)
+      coef_tab$variable <- rownames(coef_tab)
+      selected <- coef_tab[coef_tab$variable %in% predictor_z, , drop = FALSE]
+      if (nrow(selected) == 0) next
+
+      selected$variable <- sub("_z$", "", selected$variable)
+      selected$phenotype <- y
+      selected$PRS <- prs
+      selected$R2 <- sm$r.squared
+      selected$n <- nobs(fit)
+      out[[paste(prs, y, sep = "_")]] <- selected
+    }
+  }
+
+  res <- do.call(rbind, out)
+  rownames(res) <- NULL
+  res
+}
+
+meta_two_studies_linear <- function(res_D, res_R,
+                                    key_cols,
+                                    beta_col = "Estimate",
+                                    se_col = "Std. Error") {
+  D <- res_D %>%
+    select(all_of(key_cols), all_of(beta_col), all_of(se_col), n, R2) %>%
+    rename(beta_D = all_of(beta_col), se_D = all_of(se_col), n_D = n, R2_D = R2)
+
+  R <- res_R %>%
+    select(all_of(key_cols), all_of(beta_col), all_of(se_col), n, R2) %>%
+    rename(beta_R = all_of(beta_col), se_R = all_of(se_col), n_R = n, R2_R = R2)
+
+  M <- inner_join(D, R, by = key_cols) %>%
+    filter(is.finite(beta_D), is.finite(beta_R), is.finite(se_D), is.finite(se_R), se_D > 0, se_R > 0)
+
+  if (nrow(M) == 0) return(M)
+
+  wD <- 1 / (M$se_D^2)
+  wR <- 1 / (M$se_R^2)
+  w <- wD + wR
+
+  beta_FE <- (wD * M$beta_D + wR * M$beta_R) / w
+  se_FE <- sqrt(1 / w)
+  z_FE <- beta_FE / se_FE
+  p_FE <- 2 * pnorm(-abs(z_FE))
+
+  M %>% mutate(beta_FE = beta_FE, se_FE = se_FE, z_FE = z_FE, p_FE = p_FE)
+}
+
+# =============================================================================
+# 4. SEM mediation analysis
+# =============================================================================
+
+run_dx_trio_sem_mediation <- function(data,
+                                      dx_var = "diagnosis_age",
+                                      mediator,
+                                      prs_vars,
+                                      treat_var,
+                                      pc_prefix = "X",
+                                      pc_n = 10,
+                                      include_sex = TRUE,
+                                      scale_dx = TRUE,
+                                      scale_prs = TRUE,
+                                      scale_med = TRUE,
+                                      scale_pcs = TRUE,
+                                      extra_covars = NULL,
+                                      se_type = "standard",
+                                      bootstrap = 2000,
+                                      estimator = "MLR",
+                                      verbose = FALSE) {
+  dat <- as.data.table(data)
+  pc_cols <- paste0(pc_prefix, seq_len(pc_n))
+  required_cols <- unique(c(dx_var, mediator, prs_vars, if (include_sex) "sex" else NULL, pc_cols, extra_covars))
+  missing_cols <- setdiff(required_cols, names(dat))
+  if (length(missing_cols) > 0) stop("Missing columns: ", paste(missing_cols, collapse = ", "))
+
+  for (col in intersect(c(dx_var, mediator, prs_vars, pc_cols, extra_covars), names(dat))) {
+    if (col != "sex") dat[[col]] <- to_numeric_if_possible(dat[[col]])
+  }
+
+  if (include_sex && "sex" %in% names(dat)) {
+    if (is.factor(dat$sex) || is.character(dat$sex)) {
+      dat$sex <- ifelse(as.character(dat$sex) == "Female", 0,
+                        ifelse(as.character(dat$sex) == "Male", 1, NA))
+    }
+    dat$sex <- suppressWarnings(as.numeric(dat$sex))
+  }
+
+  dat_cc <- dat[complete.cases(dat[, ..required_cols])]
+  n_cc <- nrow(dat_cc)
+  if (n_cc < 50) warning("Small complete-case sample size: ", n_cc)
+
+  dx_term <- if (scale_dx) paste0(dx_var, "_z") else dx_var
+  if (scale_dx) dat_cc[[dx_term]] <- standardize_column(dat_cc[[dx_var]])
+
+  med_term <- if (scale_med) paste0(mediator, "_z") else mediator
+  if (scale_med) dat_cc[[med_term]] <- standardize_column(dat_cc[[mediator]])
+
+  prs_terms <- character(0)
+  for (p in prs_vars) {
+    term <- if (scale_prs) paste0(p, "_z") else p
+    if (scale_prs) dat_cc[[term]] <- standardize_column(dat_cc[[p]])
+    prs_terms <- c(prs_terms, term)
+  }
+
+  pc_terms <- character(0)
+  for (pc in pc_cols) {
+    term <- if (scale_pcs) paste0(pc, "_z") else pc
+    if (scale_pcs) dat_cc[[term]] <- standardize_column(dat_cc[[pc]])
+    pc_terms <- c(pc_terms, term)
+  }
+
+  treat_term <- if (scale_prs) paste0(treat_var, "_z") else treat_var
+  if (!treat_term %in% prs_terms) stop("treat_var must be included in prs_vars: ", treat_var)
+
+  covars <- unique(c(setdiff(prs_terms, treat_term), if (include_sex) "sex" else NULL, extra_covars, pc_terms))
+  covars <- covars[!is.na(covars) & nzchar(covars)]
+
+  mediator_rhs <- paste(c(treat_term, covars), collapse = " + ")
+  outcome_rhs <- paste(c(treat_term, med_term, covars), collapse = " + ")
+
+  model_syntax <- paste0(
+    med_term, " ~ a*", mediator_rhs, "\n",
+    dx_term, " ~ cprime*", treat_term, " + b*", med_term,
+    if (length(covars) > 0) paste0(" + ", paste(covars, collapse = " + ")) else "", "\n",
+    "indirect := a*b\n",
+    "direct := cprime\n",
+    "total := cprime + (a*b)\n"
+  )
+
+  if (verbose) cat(model_syntax, "\n")
+
+  fit <- lavaan::sem(
+    model = model_syntax,
+    data = as.data.frame(dat_cc),
+    se = if (se_type == "bootstrap") "bootstrap" else "standard",
+    bootstrap = if (se_type == "bootstrap") bootstrap else NULL,
+    estimator = estimator,
+    fixed.x = FALSE
+  )
+
+  result <- lavaan::parameterEstimates(fit, ci = TRUE, standardized = FALSE) %>%
+    filter(label %in% c("a", "b", "cprime") | lhs %in% c("indirect", "direct", "total")) %>%
+    mutate(phenotype = dx_var, mediator = mediator, treat = treat_var, n = n_cc)
+
+  list(result = result, fit = fit, model_syntax = model_syntax)
+}
+
+extract_sem_effects_for_meta <- function(sem_result_df) {
+  sem_result_df %>%
+    filter(lhs %in% c("indirect", "direct", "total")) %>%
+    transmute(phenotype, mediator, treat, effect = lhs, est, ci.lower, ci.upper, pvalue, n)
+}
+
+meta_two_studies_sem <- function(res_D_df, res_R_df) {
+  D <- extract_sem_effects_for_meta(res_D_df) %>%
+    rename(est_D = est, low_D = ci.lower, high_D = ci.upper, p_D = pvalue, n_D = n)
+  R <- extract_sem_effects_for_meta(res_R_df) %>%
+    rename(est_R = est, low_R = ci.lower, high_R = ci.upper, p_R = pvalue, n_R = n)
+
+  M <- inner_join(D, R, by = c("phenotype", "mediator", "treat", "effect")) %>%
+    mutate(se_D = (high_D - low_D) / (2 * 1.96), se_R = (high_R - low_R) / (2 * 1.96)) %>%
+    filter(is.finite(se_D), is.finite(se_R), se_D > 0, se_R > 0)
+
+  if (nrow(M) == 0) return(M)
+
+  wD <- 1 / (M$se_D^2)
+  wR <- 1 / (M$se_R^2)
+  w <- wD + wR
+
+  est_FE <- (wD * M$est_D + wR * M$est_R) / w
+  se_FE <- sqrt(1 / w)
+  z_FE <- est_FE / se_FE
+  p_FE <- 2 * pnorm(-abs(z_FE))
+  low_FE <- est_FE - 1.96 * se_FE
+  high_FE <- est_FE + 1.96 * se_FE
+  Q <- wD * (M$est_D - est_FE)^2 + wR * (M$est_R - est_FE)^2
+  I2 <- ifelse(Q > 0, pmax(0, (Q - 1) / Q) * 100, 0)
+
+  M %>%
+    mutate(est_FE = est_FE, se_FE = se_FE, low_FE = low_FE, high_FE = high_FE,
+           z_FE = z_FE, p_FE = p_FE, Q = Q, I2 = I2) %>%
+    arrange(factor(effect, levels = c("indirect", "direct", "total")))
+}
+
+run_one_sem_meta <- function(data_D, data_R, dx_var, mediator, treat_var, prs_vars,
+                             se_type = "standard", estimator = "MLR") {
+  tryCatch({
+    fit_D <- run_dx_trio_sem_mediation(data_D, dx_var = dx_var, mediator = mediator,
+                                       prs_vars = prs_vars, treat_var = treat_var,
+                                       se_type = se_type, estimator = estimator)
+    fit_R <- run_dx_trio_sem_mediation(data_R, dx_var = dx_var, mediator = mediator,
+                                       prs_vars = prs_vars, treat_var = treat_var,
+                                       se_type = se_type, estimator = estimator)
+    meta_two_studies_sem(fit_D$result, fit_R$result) %>%
+      mutate(dx_var = dx_var, mediator = mediator, treat_var = treat_var) %>%
+      relocate(dx_var, mediator, treat_var)
+  }, error = function(e) {
+    data.frame(dx_var = dx_var, mediator = mediator, treat_var = treat_var,
+               effect = NA_character_, error_msg = as.character(e$message))
+  })
+}
+
+run_batch_sem_mediation <- function(data_D, data_R, dx_var, mediators, prs_set) {
+  bind_rows(lapply(prs_set, function(prs) {
+    param_grid <- expand.grid(
+      mediator = mediators,
+      treat_var = c(paste0("fa_", prs), paste0("mo_", prs)),
+      stringsAsFactors = FALSE
+    )
+    pmap_dfr(param_grid, function(mediator, treat_var) {
+      run_one_sem_meta(
+        data_D = data_D,
+        data_R = data_R,
+        dx_var = dx_var,
+        mediator = mediator,
+        treat_var = treat_var,
+        prs_vars = c(prs, paste0("fa_", prs), paste0("mo_", prs))
+      )
+    })
+  }))
+}
+
+# =============================================================================
+# 5. Plotting functions
+# =============================================================================
+
+plot_trio_diagnosis_age_forest <- function(meta_trio_results) {
+  plot_data <- meta_trio_results %>%
+    filter(phenotype == outcome_dx) %>%
+    mutate(
+      group = case_when(
+        variable == PRS ~ "Proband",
+        variable == paste0("fa_", PRS) ~ "Father",
+        variable == paste0("mo_", PRS) ~ "Mother",
+        TRUE ~ NA_character_
+      ),
+      group = factor(group, levels = c("Proband", "Father", "Mother")),
+      PRS = factor(PRS, levels = prs_set),
+      ci_low = beta_FE - 1.96 * se_FE,
+      ci_high = beta_FE + 1.96 * se_FE,
+      sig = case_when(
+        p_FE < 0.001 / 3 ~ "***",
+        p_FE < 0.01 / 3 ~ "**",
+        p_FE < 0.05 / 3 ~ "*",
+        TRUE ~ ""
+      ),
+      x_num = as.numeric(PRS),
+      x_pos = x_num + case_when(group == "Proband" ~ -0.22, group == "Father" ~ 0, group == "Mother" ~ 0.22)
+    ) %>%
+    filter(!is.na(group))
+
+  y_pad <- 0.04 * (max(plot_data$ci_high, na.rm = TRUE) - min(plot_data$ci_low, na.rm = TRUE))
+
+  ggplot(plot_data, aes(x = x_pos, y = beta_FE, color = group)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey55", linewidth = 0.3) +
+    geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.06, linewidth = 0.8) +
+    geom_point(size = 2.4) +
+    geom_text(aes(y = ci_high + y_pad, label = sig), color = "black", size = 7 / ggplot2::.pt, vjust = 0) +
+    scale_x_continuous(
+      breaks = seq_along(prs_set),
+      labels = parse(text = c('PGS["EA"]', 'PGS["CP"]', 'PGS["NON_COG"]')),
+      expand = expansion(mult = c(0.06, 0.06))
+    ) +
+    scale_color_manual(
+      values = c("Proband" = "#C44E52", "Father" = "#4C72B0", "Mother" = "#55A868"),
+      labels = c("Proband" = "Direct (Proband)", "Father" = "Indirect (Paternal)", "Mother" = "Indirect (Maternal)")
+    ) +
+    labs(x = NULL, y = "Effect size", color = NULL) +
+    theme_classic(base_size = 7) +
+    theme(
+      axis.text = element_text(size = 7, color = "black"),
+      axis.title.y = element_text(size = 7, color = "black"),
+      legend.position = "right",
+      legend.text = element_text(size = 7, color = "black")
+    )
+}
+
+plot_sem_mediation_panel <- function(sem_meta_results) {
+  plot_data <- sem_meta_results %>%
+    filter(effect %in% c("indirect", "direct")) %>%
+    mutate(
+      effect_type = recode(effect, indirect = "Mediated", direct = "Unmediated"),
+      mediator = factor(toupper(mediator), levels = toupper(mediators)),
+      treat_var = factor(treat_var,
+                         levels = c("fa_NON_COG", "mo_NON_COG", "fa_CP", "mo_CP", "fa_EA", "mo_EA")),
+      pgs_group = case_when(
+        grepl("EA$", as.character(treat_var)) ~ "EA",
+        grepl("CP$", as.character(treat_var)) ~ "CP",
+        grepl("NON_COG$", as.character(treat_var)) ~ "NON_COG"
+      ),
+      fill_type = paste(pgs_group, effect_type, sep = "_"),
+      sig = case_when(p_FE < 0.05 / 15 ~ "**", p_FE < 0.05 ~ "*", TRUE ~ "")
+    )
+
+  ggplot(plot_data, aes(x = est_FE, y = treat_var, fill = fill_type, alpha = effect_type)) +
+    geom_vline(xintercept = 0, linewidth = 0.3, color = "black") +
+    geom_col(width = 0.64, color = "black", linewidth = 0.3) +
+    geom_text(data = plot_data %>% filter(sig != ""), aes(label = sig),
+              position = position_stack(vjust = 0.5, reverse = TRUE),
+              size = 7 / ggplot2::.pt, color = "black", inherit.aes = TRUE) +
+    facet_wrap(~ mediator, ncol = 5, scales = "free_x") +
+    scale_fill_manual(
+      values = c(
+        "EA_Mediated" = "#8FB6E8", "EA_Unmediated" = "#2F6DB3",
+        "CP_Mediated" = "#92C98A", "CP_Unmediated" = "#4E9B47",
+        "NON_COG_Mediated" = "#F3B37A", "NON_COG_Unmediated" = "#D97A1E"
+      ),
+      guide = "none"
+    ) +
+    scale_alpha_manual(values = c("Mediated" = 0.4, "Unmediated" = 1), name = NULL) +
+    labs(x = "Effect size", y = "PGS") +
+    theme_bw(base_size = 7) +
+    theme(panel.grid = element_blank(), legend.position = "top")
+}
+
+# =============================================================================
+# 6. Run analysis
+# =============================================================================
+
+asd_data <- prepare_asd_data(phenotype_file, discovery_file, replication_file)
+info_D_phe_asd <- asd_data$discovery
+info_R_phe_asd <- asd_data$replication
+
+# Single-predictor association models
+res_D_single <- run_single_predictor_linear_models(info_D_phe_asd, outcome_dx, prs_variables, pc_n = pc_n)
+res_R_single <- run_single_predictor_linear_models(info_R_phe_asd, outcome_dx, prs_variables, pc_n = pc_n)
+meta_single_dx <- meta_two_studies_linear(res_D_single, res_R_single, key_cols = c("phenotype", "variable"),
+                                          beta_col = "beta", se_col = "se")
+
+# Trio models including offspring, paternal, and maternal PGSs jointly
+res_D_trio <- run_trio_linear_models(info_D_phe_asd, outcome_dx, prs_set, pc_n = pc_n)
+res_R_trio <- run_trio_linear_models(info_R_phe_asd, outcome_dx, prs_set, pc_n = pc_n)
+meta_trio_dx <- meta_two_studies_linear(res_D_trio, res_R_trio, key_cols = c("phenotype", "PRS", "variable"))
+
+# SEM mediation models
+sem_mediation_meta <- run_batch_sem_mediation(info_D_phe_asd, info_R_phe_asd, outcome_dx, mediators, prs_set)
+
+# Plots
+p_trio_diagnosis_age <- plot_trio_diagnosis_age_forest(meta_trio_dx)
+p_sem_mediation <- plot_sem_mediation_panel(sem_mediation_meta)
+
+# Export results
+write.xlsx(meta_single_dx, file.path(output_dir, "diagnosis_age_single_predictor_meta.xlsx"))
+write.xlsx(meta_trio_dx, file.path(output_dir, "diagnosis_age_trio_model_meta.xlsx"))
+write.xlsx(sem_mediation_meta, file.path(output_dir, "diagnosis_age_sem_mediation_meta.xlsx"))
+
+# Print plots in interactive sessions
+print(p_trio_diagnosis_age)
+print(p_sem_mediation)
