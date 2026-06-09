@@ -1,0 +1,665 @@
+################################################################################
+# Population-level PGS association models for ASD-related phenotypes
+#
+# This script evaluates associations between offspring, paternal, and maternal
+# polygenic scores (PGSs) and ASD-related phenotypes in ASD probands. Continuous
+# phenotypes are analyzed using linear regression, binary phenotypes are analyzed
+# using logistic regression, and discovery/replication results are combined using
+# fixed-effect inverse-variance meta-analysis.
+################################################################################
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(openxlsx)
+  library(dplyr)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+  library(grid)
+})
+
+# ==============================================================================
+# 1. User-defined paths and analysis parameters
+# ==============================================================================
+
+input_dir  <- "path/to/input_files"
+output_dir <- "path/to/output_files"
+
+phenotype_file  <- file.path(input_dir, "info_phenotype_SPARK.xlsx")
+discovery_file  <- file.path(input_dir, "info_discovery.xlsx")
+replication_file <- file.path(input_dir, "info_replication.xlsx")
+
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+prs_order <- c("EA", "CP", "NON_COG")
+
+continuous_phenotypes <- c("scq", "fsiq", "rbsr", "dcdq", "srs", "vabs")
+
+binary_phenotypes <- c(
+  "dev_lang",
+  "mood_or_anx",
+  "attn_behav",
+  "schiz",
+  "sleep_dx"
+)
+
+binary_phenotype_labels <- c(
+  dev_lang    = "Developmental",
+  mood_or_anx = "Mood",
+  attn_behav  = "Behavior",
+  schiz       = "Schizophrenia",
+  sleep_dx    = "Sleep"
+)
+
+pgs_variables <- c(
+  prs_order,
+  paste0("fa_", prs_order),
+  paste0("mo_", prs_order)
+)
+
+# ==============================================================================
+# 2. Data import and preprocessing
+# ==============================================================================
+
+merge_without_duplicate_columns <- function(df_left, df_right) {
+  duplicate_cols <- intersect(colnames(df_left), colnames(df_right))
+  df_right_unique <- df_right[, setdiff(colnames(df_right), duplicate_cols), drop = FALSE]
+  cbind(df_left, df_right_unique)
+}
+
+read_and_prepare_data <- function(phenotype_file, discovery_file, replication_file) {
+  phenotype_info <- openxlsx::read.xlsx(phenotype_file)
+  discovery_info <- openxlsx::read.xlsx(discovery_file)
+  replication_info <- openxlsx::read.xlsx(replication_file)
+
+  discovery_data <- merge_without_duplicate_columns(discovery_info, phenotype_info)
+  replication_data <- merge_without_duplicate_columns(replication_info, phenotype_info)
+
+  discovery_data <- discovery_data %>%
+    filter(keep == 1, asd == TRUE) %>%
+    mutate(sex = factor(sex, levels = c("Female", "Male")))
+
+  replication_data <- replication_data %>%
+    filter(keep == 1, asd == TRUE) %>%
+    mutate(sex = factor(sex, levels = c("Female", "Male")))
+
+  list(discovery = discovery_data, replication = replication_data)
+}
+
+as_numeric_safe <- function(x) {
+  if (is.numeric(x)) return(x)
+  suppressWarnings(as.numeric(x))
+}
+
+get_pc_columns_for_pgs <- function(x, pc_n = 10, child_prefix = "X") {
+  if (grepl("^fa_", x)) {
+    paste0("fa_", child_prefix, seq_len(pc_n))
+  } else if (grepl("^mo_", x)) {
+    paste0("mo_", child_prefix, seq_len(pc_n))
+  } else {
+    paste0(child_prefix, seq_len(pc_n))
+  }
+}
+
+standardize_columns <- function(dat, cols) {
+  for (col in intersect(cols, names(dat))) {
+    dat[[col]] <- as_numeric_safe(dat[[col]])
+    if (is.numeric(dat[[col]])) {
+      dat[[paste0(col, "_z")]] <- as.numeric(scale(dat[[col]]))
+    }
+  }
+  dat
+}
+
+# ==============================================================================
+# 3. Single-predictor linear models for continuous phenotypes
+# ==============================================================================
+
+run_single_predictor_linear_models <- function(data,
+                                               phenotype_list,
+                                               predictor_list,
+                                               pc_prefix = "X",
+                                               pc_n = 10,
+                                               sex_var = "sex") {
+  dat <- as.data.table(data)
+
+  if (!sex_var %in% names(dat)) {
+    stop("Missing sex variable: ", sex_var)
+  }
+
+  dat[[sex_var]] <- as.factor(dat[[sex_var]])
+  if (all(c("Female", "Male") %in% levels(dat[[sex_var]]))) {
+    dat[[sex_var]] <- factor(dat[[sex_var]], levels = c("Female", "Male"))
+  }
+
+  all_pc_cols <- unique(unlist(lapply(
+    predictor_list,
+    get_pc_columns_for_pgs,
+    pc_n = pc_n,
+    child_prefix = pc_prefix
+  )))
+
+  numeric_candidates <- unique(c(
+    phenotype_list,
+    paste0(phenotype_list, "_age"),
+    predictor_list,
+    all_pc_cols
+  ))
+
+  for (col in intersect(numeric_candidates, names(dat))) {
+    if (col != sex_var) dat[[col]] <- as_numeric_safe(dat[[col]])
+  }
+
+  dat <- standardize_columns(dat, predictor_list)
+  dat <- standardize_columns(dat, all_pc_cols)
+
+  results <- list()
+
+  for (phenotype in phenotype_list) {
+    if (!phenotype %in% names(dat) || !is.numeric(dat[[phenotype]])) next
+
+    phenotype_z <- paste0(phenotype, "_z")
+    dat[[phenotype_z]] <- as.numeric(scale(dat[[phenotype]]))
+    age_var <- paste0(phenotype, "_age")
+
+    for (predictor in predictor_list) {
+      predictor_z <- paste0(predictor, "_z")
+      if (!predictor_z %in% names(dat)) next
+
+      pc_cols <- get_pc_columns_for_pgs(predictor, pc_n = pc_n, child_prefix = pc_prefix)
+      pc_z_cols <- intersect(paste0(pc_cols, "_z"), names(dat))
+
+      model_terms <- c(
+        predictor_z,
+        sex_var,
+        if (age_var %in% names(dat)) age_var else NULL,
+        pc_z_cols
+      )
+
+      model_formula <- as.formula(
+        paste0(phenotype_z, " ~ ", paste(model_terms, collapse = " + "))
+      )
+
+      fit <- lm(model_formula, data = dat)
+      fit_summary <- summary(fit)
+      coef_table <- as.data.frame(fit_summary$coefficients)
+
+      if (!predictor_z %in% rownames(coef_table)) next
+
+      row <- coef_table[predictor_z, , drop = FALSE]
+      row$n <- nobs(fit)
+      row$variable <- predictor
+      row$phenotype <- phenotype
+      row$R2 <- fit_summary$r.squared
+      row$pc_set <- paste(pc_cols[pc_cols %in% names(dat)], collapse = ",")
+
+      results[[paste(phenotype, predictor, sep = "_")]] <- row
+    }
+  }
+
+  output <- do.call(rbind, results)
+  rownames(output) <- NULL
+
+  output %>%
+    rename(
+      beta = Estimate,
+      se   = `Std. Error`,
+      t    = `t value`,
+      p    = `Pr(>|t|)`
+    )
+}
+
+# ==============================================================================
+# 4. Single-predictor logistic models for binary phenotypes
+# ==============================================================================
+
+run_single_predictor_logistic_models <- function(data,
+                                                 phenotype_list,
+                                                 predictor_list,
+                                                 pc_n = 10,
+                                                 age_var = "med_age",
+                                                 sex_var = "sex") {
+  dat <- as.data.table(data)
+
+  if (!sex_var %in% names(dat)) {
+    stop("Missing sex variable: ", sex_var)
+  }
+
+  dat[[sex_var]] <- as.factor(dat[[sex_var]])
+  if (all(c("Female", "Male") %in% levels(dat[[sex_var]]))) {
+    dat[[sex_var]] <- factor(dat[[sex_var]], levels = c("Female", "Male"))
+  }
+
+  all_pc_cols <- unique(unlist(lapply(
+    predictor_list,
+    get_pc_columns_for_pgs,
+    pc_n = pc_n
+  )))
+
+  numeric_candidates <- unique(c(phenotype_list, predictor_list, age_var, all_pc_cols))
+
+  for (col in intersect(numeric_candidates, names(dat))) {
+    if (col != sex_var) dat[[col]] <- as_numeric_safe(dat[[col]])
+  }
+
+  dat <- standardize_columns(dat, predictor_list)
+  dat <- standardize_columns(dat, all_pc_cols)
+
+  results <- list()
+
+  for (phenotype in phenotype_list) {
+    if (!phenotype %in% names(dat)) next
+    dat[[phenotype]] <- as.numeric(dat[[phenotype]])
+
+    for (predictor in predictor_list) {
+      predictor_z <- paste0(predictor, "_z")
+      if (!predictor_z %in% names(dat)) next
+
+      pc_cols <- get_pc_columns_for_pgs(predictor, pc_n = pc_n)
+      pc_z_cols <- intersect(paste0(pc_cols, "_z"), names(dat))
+
+      model_terms <- c(predictor_z, sex_var, age_var, pc_z_cols)
+
+      model_formula <- as.formula(
+        paste0(phenotype, " ~ ", paste(model_terms, collapse = " + "))
+      )
+
+      fit <- glm(model_formula, data = dat, family = binomial)
+      fit_summary <- summary(fit)
+      coef_table <- as.data.frame(fit_summary$coefficients)
+
+      if (!predictor_z %in% rownames(coef_table)) next
+
+      row <- coef_table[predictor_z, , drop = FALSE]
+      row$OR <- exp(row$Estimate)
+      row$CI_lower <- exp(row$Estimate - 1.96 * row$`Std. Error`)
+      row$CI_upper <- exp(row$Estimate + 1.96 * row$`Std. Error`)
+      row$n <- nobs(fit)
+
+      null_fit <- glm(as.formula(paste0(phenotype, " ~ 1")), data = dat, family = binomial)
+      row$R2 <- 1 - as.numeric(logLik(fit) / logLik(null_fit))
+
+      row$variable <- predictor
+      row$phenotype <- phenotype
+      row$pc_set <- paste(pc_cols[pc_cols %in% names(dat)], collapse = ",")
+      row$pc_type <- case_when(
+        grepl("^fa_", predictor) ~ "father",
+        grepl("^mo_", predictor) ~ "mother",
+        TRUE ~ "child"
+      )
+
+      results[[paste(phenotype, predictor, sep = "_")]] <- row
+    }
+  }
+
+  output <- do.call(rbind, results)
+  rownames(output) <- NULL
+  output
+}
+
+# ==============================================================================
+# 5. Fixed-effect meta-analysis
+# ==============================================================================
+
+meta_two_studies_linear <- function(discovery_results,
+                                    replication_results,
+                                    key_cols = c("phenotype", "variable"),
+                                    beta_col = "beta",
+                                    se_col = "se") {
+  discovery <- discovery_results %>%
+    select(all_of(key_cols), all_of(beta_col), all_of(se_col), p, n, R2) %>%
+    rename(
+      beta_D = all_of(beta_col),
+      se_D = all_of(se_col),
+      p_D = p,
+      n_D = n,
+      R2_D = R2
+    )
+
+  replication <- replication_results %>%
+    select(all_of(key_cols), all_of(beta_col), all_of(se_col), p, n, R2) %>%
+    rename(
+      beta_R = all_of(beta_col),
+      se_R = all_of(se_col),
+      p_R = p,
+      n_R = n,
+      R2_R = R2
+    )
+
+  meta <- inner_join(discovery, replication, by = key_cols) %>%
+    filter(
+      is.finite(beta_D), is.finite(beta_R),
+      is.finite(se_D), is.finite(se_R),
+      se_D > 0, se_R > 0
+    )
+
+  if (nrow(meta) == 0) return(meta)
+
+  weight_D <- 1 / meta$se_D^2
+  weight_R <- 1 / meta$se_R^2
+  weight_sum <- weight_D + weight_R
+
+  beta_FE <- (weight_D * meta$beta_D + weight_R * meta$beta_R) / weight_sum
+  se_FE <- sqrt(1 / weight_sum)
+  z_FE <- beta_FE / se_FE
+  p_FE <- 2 * pnorm(-abs(z_FE))
+
+  meta %>%
+    mutate(
+      beta_FE = beta_FE,
+      se_FE = se_FE,
+      z_FE = z_FE,
+      p_FE = p_FE
+    )
+}
+
+meta_two_studies_logistic <- function(discovery_results,
+                                      replication_results,
+                                      key_cols = c("phenotype", "variable"),
+                                      beta_col = "Estimate",
+                                      se_col = "Std. Error") {
+  discovery <- discovery_results %>%
+    select(all_of(key_cols), all_of(beta_col), all_of(se_col), n) %>%
+    rename(
+      beta_D = all_of(beta_col),
+      se_D = all_of(se_col),
+      n_D = n
+    )
+
+  replication <- replication_results %>%
+    select(all_of(key_cols), all_of(beta_col), all_of(se_col), n) %>%
+    rename(
+      beta_R = all_of(beta_col),
+      se_R = all_of(se_col),
+      n_R = n
+    )
+
+  meta <- inner_join(discovery, replication, by = key_cols) %>%
+    filter(
+      is.finite(beta_D), is.finite(beta_R),
+      is.finite(se_D), is.finite(se_R),
+      se_D > 0, se_R > 0
+    )
+
+  if (nrow(meta) == 0) return(meta)
+
+  weight_D <- 1 / meta$se_D^2
+  weight_R <- 1 / meta$se_R^2
+  weight_sum <- weight_D + weight_R
+
+  beta_FE <- (weight_D * meta$beta_D + weight_R * meta$beta_R) / weight_sum
+  se_FE <- sqrt(1 / weight_sum)
+  z_FE <- beta_FE / se_FE
+  p_FE <- 2 * pnorm(-abs(z_FE))
+
+  meta %>%
+    mutate(
+      beta_FE = beta_FE,
+      se_FE = se_FE,
+      z_FE = z_FE,
+      p_FE = p_FE,
+      OR_FE = exp(beta_FE),
+      CI_lower_FE = exp(beta_FE - 1.96 * se_FE),
+      CI_upper_FE = exp(beta_FE + 1.96 * se_FE)
+    )
+}
+
+# ==============================================================================
+# 6. Plotting functions
+# ==============================================================================
+
+add_pgs_group_columns <- function(data) {
+  data %>%
+    mutate(
+      group = case_when(
+        grepl("^fa_", variable) ~ "Paternal",
+        grepl("^mo_", variable) ~ "Maternal",
+        variable %in% prs_order ~ "Proband",
+        TRUE ~ NA_character_
+      ),
+      prs = case_when(
+        group == "Paternal" ~ sub("^fa_", "", variable),
+        group == "Maternal" ~ sub("^mo_", "", variable),
+        group == "Proband"  ~ variable,
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    filter(!is.na(group), prs %in% prs_order)
+}
+
+plot_linear_bubble <- function(meta_results, n_bonf = 18) {
+  plot_data <- meta_results %>%
+    add_pgs_group_columns() %>%
+    as.data.table()
+
+  if (nrow(plot_data) == 0) {
+    warning("No valid linear meta-analysis results to plot.")
+    return(NULL)
+  }
+
+  plot_data[, p_adj := p.adjust(p_FE, method = "bonferroni", n = n_bonf), by = group]
+  plot_data[, sig := fifelse(
+    p_adj < 0.001, "***",
+    fifelse(p_adj < 0.01, "**", fifelse(p_adj < 0.05, "*", ""))
+  )]
+  plot_data[, logP := -log10(p_adj)]
+
+  if (any(is.infinite(plot_data$logP))) {
+    max_finite <- max(plot_data$logP[is.finite(plot_data$logP)], na.rm = TRUE)
+    if (!is.finite(max_finite)) max_finite <- 25
+    plot_data[is.infinite(logP), logP := max_finite + 1]
+  }
+
+  plot_data[, logP_plot := pmin(logP, 25)]
+  plot_data[, prs := factor(prs, levels = prs_order)]
+  plot_data[, phenotype := factor(
+    toupper(phenotype),
+    levels = c("VABS", "DCDQ", "FSIQ", "RBSR", "SRS", "SCQ")
+  )]
+  plot_data[, group := factor(group, levels = c("Proband", "Paternal", "Maternal"))]
+
+  max_abs_beta <- max(abs(plot_data$beta_FE), na.rm = TRUE)
+  if (!is.finite(max_abs_beta) || max_abs_beta == 0) max_abs_beta <- 1
+
+  ggplot(plot_data, aes(x = prs, y = phenotype, size = logP_plot, fill = beta_FE)) +
+    geom_point(shape = 21, color = "gray25", stroke = 0.25, alpha = 0.95) +
+    geom_text(aes(label = sig), color = "black", size = 3.2, fontface = "bold", show.legend = FALSE) +
+    facet_wrap(~group, nrow = 1) +
+    scale_x_discrete(
+      breaks = prs_order,
+      labels = c(expression(PGS[EA]), expression(PGS[CP]), expression(PGS[NON_COG]))
+    ) +
+    scale_fill_distiller(
+      palette = "RdBu",
+      direction = -1,
+      limits = c(-max_abs_beta, max_abs_beta),
+      name = "Effect size"
+    ) +
+    scale_size_continuous(
+      range = c(4.5, 8.5),
+      limits = c(0, 25),
+      breaks = c(1, 5, 10, 25),
+      name = expression(-log[10](P[adj]))
+    ) +
+    labs(x = NULL, y = NULL) +
+    theme_classic(base_size = 11) +
+    theme(
+      axis.line = element_line(linewidth = 0.6, color = "black"),
+      axis.ticks = element_line(linewidth = 0.5, color = "black"),
+      axis.ticks.length = unit(2.0, "mm"),
+      axis.text.x = element_text(size = 7, color = "black", angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 7, color = "black"),
+      strip.background = element_blank(),
+      strip.text = element_text(size = 9, face = "bold", color = "black"),
+      panel.spacing = unit(1.0, "lines"),
+      legend.position = "right",
+      legend.title = element_text(size = 9),
+      legend.text = element_text(size = 8),
+      legend.key.height = unit(0.9, "cm"),
+      legend.key.width = unit(0.45, "cm"),
+      plot.margin = margin(8, 10, 8, 8)
+    )
+}
+
+plot_logistic_forest_panel <- function(meta_results, n_bonf = 15) {
+  plot_data <- meta_results %>%
+    add_pgs_group_columns() %>%
+    mutate(
+      prs = factor(prs, levels = prs_order),
+      group = factor(group, levels = c("Proband", "Paternal", "Maternal")),
+      p_adj = ave(p_FE, group, FUN = function(p) p.adjust(p, method = "bonferroni", n = n_bonf)),
+      sig = case_when(
+        p_adj < 0.001 ~ "***",
+        p_adj < 0.01 ~ "**",
+        p_adj < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      panel_title = case_when(
+        phenotype == "dev_lang" ~ "Developmental",
+        phenotype == "mood_or_anx" ~ "Mood",
+        phenotype == "attn_behav" ~ "Behavior",
+        phenotype == "schiz" ~ "Schizophrenia",
+        phenotype == "sleep_dx" ~ "Sleep",
+        TRUE ~ as.character(phenotype)
+      )
+    )
+
+  group_colors <- c(
+    Proband  = "#B85C5C",
+    Paternal = "#6487C0",
+    Maternal = "#6AA27A"
+  )
+
+  plot_one_phenotype <- function(phenotype_name) {
+    dat <- plot_data %>%
+      filter(phenotype == phenotype_name) %>%
+      mutate(prs_y = factor(as.character(prs), levels = rev(prs_order)))
+
+    if (nrow(dat) == 0) return(NULL)
+
+    dodge <- position_dodge(width = 0.58)
+
+    ggplot(
+      dat,
+      aes(
+        x = OR_FE,
+        y = prs_y,
+        xmin = CI_lower_FE,
+        xmax = CI_upper_FE,
+        color = group,
+        group = group
+      )
+    ) +
+      geom_vline(xintercept = 1, linetype = "dashed", linewidth = 0.35, color = "black") +
+      geom_errorbarh(height = 0.16, position = dodge, linewidth = 0.28) +
+      geom_point(size = 2.6, shape = 16, position = dodge) +
+      geom_text(
+        aes(label = sig),
+        position = dodge,
+        vjust = -0.35,
+        size = 2.4,
+        fontface = "bold",
+        show.legend = FALSE,
+        color = "black"
+      ) +
+      scale_color_manual(values = group_colors, breaks = c("Proband", "Paternal", "Maternal"), name = NULL) +
+      scale_x_log10(breaks = c(0.8, 1.0, 1.2), labels = label_number(accuracy = 0.01)) +
+      scale_y_discrete(
+        breaks = prs_order,
+        labels = c(expression(PGS[EA]), expression(PGS[CP]), expression(PGS[NON_COG]))
+      ) +
+      labs(x = NULL, y = "Polygenic score", title = unique(dat$panel_title)[1]) +
+      theme_classic(base_size = 11) +
+      theme(
+        axis.line = element_line(linewidth = 0.6, color = "black"),
+        axis.ticks = element_line(linewidth = 0.5, color = "black"),
+        axis.ticks.length = unit(2.0, "mm"),
+        axis.text.y = element_text(size = 7, color = "black"),
+        axis.text.x = element_text(size = 7, color = "black"),
+        axis.title.y = element_text(size = 7, color = "black"),
+        plot.title = element_text(size = 7, hjust = 0.5),
+        legend.position = "right",
+        legend.title = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        legend.key.size = unit(0.7, "lines"),
+        plot.margin = margin(8, 8, 8, 8)
+      )
+  }
+
+  plots <- lapply(binary_phenotypes, plot_one_phenotype)
+  plots <- Filter(Negate(is.null), plots)
+
+  if (length(plots) == 0) return(NULL)
+
+  if (length(plots) > 1) {
+    for (i in 2:length(plots)) {
+      plots[[i]] <- plots[[i]] +
+        labs(y = NULL) +
+        theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank())
+    }
+  }
+
+  wrap_plots(plots, nrow = 1) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "right")
+}
+
+# ==============================================================================
+# 7. Run analysis
+# ==============================================================================
+
+data_list <- read_and_prepare_data(
+  phenotype_file = phenotype_file,
+  discovery_file = discovery_file,
+  replication_file = replication_file
+)
+
+linear_discovery <- run_single_predictor_linear_models(
+  data = data_list$discovery,
+  phenotype_list = continuous_phenotypes,
+  predictor_list = pgs_variables
+)
+
+linear_replication <- run_single_predictor_linear_models(
+  data = data_list$replication,
+  phenotype_list = continuous_phenotypes,
+  predictor_list = pgs_variables
+)
+
+linear_meta <- meta_two_studies_linear(linear_discovery, linear_replication)
+
+logistic_discovery <- run_single_predictor_logistic_models(
+  data = data_list$discovery,
+  phenotype_list = binary_phenotypes,
+  predictor_list = pgs_variables
+)
+
+logistic_replication <- run_single_predictor_logistic_models(
+  data = data_list$replication,
+  phenotype_list = binary_phenotypes,
+  predictor_list = pgs_variables
+)
+
+logistic_meta <- meta_two_studies_logistic(logistic_discovery, logistic_replication)
+
+# ==============================================================================
+# 8. Save outputs and generate plots
+# ==============================================================================
+
+openxlsx::write.xlsx(
+  linear_meta,
+  file.path(output_dir, "population_model_linear_meta.xlsx"),
+  overwrite = TRUE
+)
+
+openxlsx::write.xlsx(
+  logistic_meta,
+  file.path(output_dir, "population_model_binary_meta.xlsx"),
+  overwrite = TRUE
+)
+
+p_linear_bubble <- plot_linear_bubble(linear_meta, n_bonf = 18)
+p_logistic_forest <- plot_logistic_forest_panel(logistic_meta, n_bonf = 15)
+
+p_linear_bubble
+p_logistic_forest
