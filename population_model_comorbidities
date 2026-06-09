@@ -1,0 +1,450 @@
+# Description: This script evaluates associations between offspring and parental polygenic scores
+# and binary ASD-related comorbidities in ASD probands. Discovery and replication results are
+# combined using fixed-effect meta-analysis and visualized as phenotype-specific forest plots.
+
+library(data.table)
+library(openxlsx)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(grid)
+
+# -----------------------------------------------------------------------------
+# 1. Load cohort-level phenotype and PGS data
+# -----------------------------------------------------------------------------
+# Replace these example paths with your own project paths before running.
+phenotype_file   <- "path/to/info_phenotype_SPARK.xlsx"
+discovery_file   <- "path/to/info_discovery.xlsx"
+replication_file <- "path/to/info_replication.xlsx"
+
+info_phe <- read.xlsx(phenotype_file)
+info_D   <- read.xlsx(discovery_file)
+info_R   <- read.xlsx(replication_file)
+
+# Combine two data frames by columns after removing duplicated columns from the right table.
+cbind_drop_dup <- function(df_left, df_right) {
+  duplicate_cols <- intersect(colnames(df_left), colnames(df_right))
+  df_right_unique <- df_right[, setdiff(colnames(df_right), duplicate_cols), drop = FALSE]
+  cbind(df_left, df_right_unique)
+}
+
+info_R_phe <- cbind_drop_dup(info_R, info_phe)
+info_D_phe <- cbind_drop_dup(info_D, info_phe)
+
+# Keep samples that passed QC and restrict the analysis to ASD probands.
+info_D_phe <- info_D_phe %>% filter(keep == 1)
+info_R_phe <- info_R_phe %>% filter(keep == 1)
+
+info_D_phe_asd <- info_D_phe[info_D_phe$asd == TRUE, ]
+info_R_phe_asd <- info_R_phe[info_R_phe$asd == TRUE, ]
+
+# Set sex factor level order for consistent model coding.
+info_D_phe_asd$sex <- factor(info_D_phe_asd$sex, levels = c("Female", "Male"))
+info_R_phe_asd$sex <- factor(info_R_phe_asd$sex, levels = c("Female", "Male"))
+
+# -----------------------------------------------------------------------------
+# 2. Define binary phenotypes and PGS predictors
+# -----------------------------------------------------------------------------
+binary_phenotypes <- c(
+  "dev_lang",
+  "mood_or_anx",
+  "attn_behav",
+  "schiz",
+  "sleep_dx"
+)
+
+prs_base <- c("EA", "CP", "NON_COG")
+
+pgs_predictors <- c(
+  prs_base,
+  paste0("fa_", prs_base),
+  paste0("mo_", prs_base)
+)
+
+# -----------------------------------------------------------------------------
+# 3. Run logistic regression models for one cohort
+# -----------------------------------------------------------------------------
+run_univariate_logistic <- function(data, Y_list, X_interest, pc_n = 10) {
+  dat <- as.data.table(data)
+  out <- list()
+
+  # Ensure the sex variable is present and coded consistently.
+  if (!("sex" %in% names(dat))) {
+    stop("The sex column was not found. Please check the column name and capitalization.")
+  }
+
+  dat[["sex"]] <- as.factor(dat[["sex"]])
+  sex_levels <- levels(dat[["sex"]])
+  if (all(c("Female", "Male") %in% sex_levels)) {
+    dat[["sex"]] <- factor(dat[["sex"]], levels = c("Female", "Male"))
+  }
+
+  # Select the ancestry principal components corresponding to the tested PGS.
+  # Offspring PGS uses offspring PCs; paternal PGS uses paternal PCs; maternal PGS uses maternal PCs.
+  get_pc_cols_for_x <- function(x, pc_n = 10) {
+    if (grepl("^fa_", x)) {
+      return(paste0("fa_X", 1:pc_n))
+    } else if (grepl("^mo_", x)) {
+      return(paste0("mo_X", 1:pc_n))
+    } else {
+      return(paste0("X", 1:pc_n))
+    }
+  }
+
+  all_PC_cols <- unique(unlist(lapply(X_interest, get_pc_cols_for_x, pc_n = pc_n)))
+
+  # Convert relevant variables to numeric where possible.
+  to_num <- function(x) {
+    if (is.numeric(x)) return(x)
+    suppressWarnings(as.numeric(x))
+  }
+
+  maybe_numeric_cols <- unique(c(
+    Y_list,
+    X_interest,
+    "med_age",
+    all_PC_cols
+  ))
+
+  for (v in intersect(maybe_numeric_cols, names(dat))) {
+    if (v != "sex") dat[[v]] <- to_num(dat[[v]])
+  }
+
+  # Standardize PGS predictors.
+  for (x in X_interest) {
+    if (x %in% names(dat) && is.numeric(dat[[x]])) {
+      dat[[paste0(x, "_z")]] <- as.numeric(scale(dat[[x]]))
+    }
+  }
+
+  # Standardize ancestry PCs.
+  for (pc in all_PC_cols) {
+    if (pc %in% names(dat) && is.numeric(dat[[pc]])) {
+      dat[[paste0(pc, "_z")]] <- as.numeric(scale(dat[[pc]]))
+    }
+  }
+
+  # Fit logistic regression models for each phenotype-PGS pair.
+  for (y in Y_list) {
+    if (!y %in% names(dat)) next
+    dat[[y]] <- as.numeric(dat[[y]])
+
+    for (x in X_interest) {
+      x_z <- paste0(x, "_z")
+      if (!x_z %in% names(dat)) next
+
+      this_PC_cols <- get_pc_cols_for_x(x, pc_n = pc_n)
+      this_PC_z <- intersect(paste0(this_PC_cols, "_z"), names(dat))
+
+      covariates <- c(
+        x_z,
+        "sex",
+        "med_age",
+        this_PC_z
+      )
+
+      model_formula <- as.formula(paste0(y, " ~ ", paste(covariates, collapse = " + ")))
+
+      fit <- glm(model_formula, data = dat, family = binomial)
+      model_summary <- summary(fit)
+      n <- nobs(fit)
+
+      coef_tab <- as.data.frame(model_summary$coefficients)
+      if (!x_z %in% rownames(coef_tab)) next
+
+      row <- coef_tab[rownames(coef_tab) == x_z, , drop = FALSE]
+
+      # Convert log-odds estimates to odds ratios and 95% confidence intervals.
+      row$OR       <- exp(row$Estimate)
+      row$CI_lower <- exp(row$Estimate - 1.96 * row$`Std. Error`)
+      row$CI_upper <- exp(row$Estimate + 1.96 * row$`Std. Error`)
+      row$n        <- n
+
+      # Calculate McFadden pseudo-R2.
+      null_fit <- glm(as.formula(paste0(y, " ~ 1")), data = dat, family = binomial)
+      row$R2 <- 1 - as.numeric(logLik(fit) / logLik(null_fit))
+
+      row$variable  <- x
+      row$phenotype <- y
+      row$pc_set    <- paste(this_PC_cols[this_PC_cols %in% names(dat)], collapse = ",")
+      row$pc_type   <- if (grepl("^fa_", x)) {
+        "father"
+      } else if (grepl("^mo_", x)) {
+        "mother"
+      } else {
+        "child"
+      }
+
+      out[[paste0(y, "_", x)]] <- row
+    }
+  }
+
+  res <- do.call(rbind, out)
+  rownames(res) <- NULL
+  return(res)
+}
+
+res_logit_D_asd <- run_univariate_logistic(info_D_phe_asd, binary_phenotypes, pgs_predictors)
+res_logit_R_asd <- run_univariate_logistic(info_R_phe_asd, binary_phenotypes, pgs_predictors)
+
+# -----------------------------------------------------------------------------
+# 4. Fixed-effect meta-analysis of discovery and replication results
+# -----------------------------------------------------------------------------
+meta_two_studies_logit_FE <- function(res_D, res_R,
+                                      key_cols = c("phenotype", "variable"),
+                                      beta_col = "Estimate",
+                                      se_col   = "Std. Error") {
+  discovery <- res_D %>%
+    select(all_of(key_cols), all_of(beta_col), all_of(se_col), n) %>%
+    rename(
+      beta_D = all_of(beta_col),
+      se_D   = all_of(se_col),
+      n_D    = n
+    )
+
+  replication <- res_R %>%
+    select(all_of(key_cols), all_of(beta_col), all_of(se_col), n) %>%
+    rename(
+      beta_R = all_of(beta_col),
+      se_R   = all_of(se_col),
+      n_R    = n
+    )
+
+  meta_input <- inner_join(discovery, replication, by = key_cols) %>%
+    filter(
+      is.finite(beta_D), is.finite(beta_R),
+      is.finite(se_D),   is.finite(se_R),
+      se_D > 0, se_R > 0
+    )
+
+  if (nrow(meta_input) == 0) return(meta_input)
+
+  # Fixed-effect inverse-variance weighted estimates.
+  wD <- 1 / (meta_input$se_D^2)
+  wR <- 1 / (meta_input$se_R^2)
+  w  <- wD + wR
+
+  beta_FE <- (wD * meta_input$beta_D + wR * meta_input$beta_R) / w
+  se_FE   <- sqrt(1 / w)
+  z_FE    <- beta_FE / se_FE
+  p_FE    <- 2 * pnorm(-abs(z_FE))
+
+  # Convert pooled log-odds estimates to odds ratios.
+  OR_FE       <- exp(beta_FE)
+  CI_lower_FE <- exp(beta_FE - 1.96 * se_FE)
+  CI_upper_FE <- exp(beta_FE + 1.96 * se_FE)
+
+  meta_input %>%
+    mutate(
+      beta_FE = beta_FE,
+      se_FE   = se_FE,
+      z_FE    = z_FE,
+      p_FE    = p_FE,
+      OR_FE   = OR_FE,
+      CI_lower_FE = CI_lower_FE,
+      CI_upper_FE = CI_upper_FE
+    )
+}
+
+meta_logit_asd_FE <- meta_two_studies_logit_FE(res_logit_D_asd, res_logit_R_asd)
+
+# Apply Bonferroni correction within each source group.
+meta_logit_asd_FE2 <- as.data.table(meta_logit_asd_FE)
+
+meta_logit_asd_FE2[, group := fifelse(
+  grepl("^fa_", variable), "Paternal",
+  fifelse(grepl("^mo_", variable), "Maternal", "Proband")
+)]
+
+meta_logit_asd_FE2[, p_adj := p.adjust(p_FE, method = "bonferroni", n = 15), by = group]
+
+meta_logit_asd_FE2[, sig := fifelse(
+  p_adj < 0.001, "***",
+  fifelse(p_adj < 0.01, "**",
+          fifelse(p_adj < 0.05, "*", ""))
+)]
+
+# Optional: export results.
+# write.xlsx(meta_logit_asd_FE2, "path/to/pop_pop_model_binary_results.xlsx")
+
+# -----------------------------------------------------------------------------
+# 5. Prepare data for forest plots
+# -----------------------------------------------------------------------------
+prs_order <- c("EA", "CP", "NON_COG")
+
+meta_logit_asd_FE2 <- meta_logit_asd_FE2 %>%
+  mutate(
+    group = case_when(
+      grepl("^fa_", variable) ~ "Paternal",
+      grepl("^mo_", variable) ~ "Maternal",
+      variable %in% prs_order ~ "Proband",
+      TRUE ~ NA_character_
+    ),
+    prs = case_when(
+      group == "Paternal" ~ sub("^fa_", "", variable),
+      group == "Maternal" ~ sub("^mo_", "", variable),
+      group == "Proband"  ~ variable,
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(group), prs %in% prs_order) %>%
+  mutate(
+    prs = factor(prs, levels = prs_order),
+    group = factor(group, levels = c("Proband", "Paternal", "Maternal")),
+    panel_title = case_when(
+      phenotype == "dev_lang"    ~ "Developmental",
+      phenotype == "mood_or_anx" ~ "Mood",
+      phenotype == "attn_behav"  ~ "Behavior",
+      phenotype == "schiz"       ~ "Schizophrenia",
+      phenotype == "sleep_dx"    ~ "Sleep",
+      TRUE ~ as.character(phenotype)
+    )
+  )
+
+# Low-saturation colors for the three PGS source groups.
+group_colors <- c(
+  "Proband"  = "#B85C5C",
+  "Paternal" = "#6487C0",
+  "Maternal" = "#6AA27A"
+)
+
+# -----------------------------------------------------------------------------
+# 6. Plot one phenotype-specific forest plot
+# -----------------------------------------------------------------------------
+plot_forest_one_pheno_ng <- function(dat, pheno) {
+  d <- dat %>% filter(phenotype == pheno)
+  if (nrow(d) == 0) return(NULL)
+
+  d <- d %>%
+    mutate(
+      prs_y = factor(as.character(prs), levels = rev(prs_order)),
+      group = factor(as.character(group), levels = c("Proband", "Paternal", "Maternal"))
+    )
+
+  pd <- position_dodge(width = 0.58)
+
+  ggplot(
+    d,
+    aes(
+      x = OR_FE,
+      y = prs_y,
+      xmin = CI_lower_FE,
+      xmax = CI_upper_FE,
+      color = group,
+      group = group
+    )
+  ) +
+    geom_vline(
+      xintercept = 1,
+      linetype = "dashed",
+      linewidth = 0.35,
+      color = "black"
+    ) +
+    geom_errorbarh(
+      height = 0.16,
+      position = pd,
+      linewidth = 0.28
+    ) +
+    geom_point(
+      size = 2.6,
+      shape = 16,
+      position = pd
+    ) +
+    geom_text(
+      aes(label = sig),
+      position = pd,
+      vjust = -0.35,
+      size = 2.4,
+      fontface = "bold",
+      show.legend = FALSE,
+      color = "black"
+    ) +
+    scale_color_manual(
+      values = group_colors,
+      breaks = c("Proband", "Paternal", "Maternal"),
+      name = NULL
+    ) +
+    scale_x_log10(
+      breaks = c(0.8, 1.0, 1.2),
+      labels = label_number(accuracy = 0.01)
+    ) +
+    scale_y_discrete(
+      breaks = c("EA", "CP", "NON_COG"),
+      labels = c(
+        expression(PGS[EA]),
+        expression(PGS[CP]),
+        expression(PGS[NON_COG])
+      )
+    ) +
+    labs(
+      x = NULL,
+      y = "Polygenic score",
+      title = unique(d$panel_title)[1]
+    ) +
+    theme_classic(base_size = 11) +
+    theme(
+      axis.line = element_line(linewidth = 0.6, color = "black"),
+      axis.ticks = element_line(linewidth = 0.5, color = "black"),
+      axis.ticks.length = unit(2.0, "mm"),
+      axis.text.y = element_text(size = 7, color = "black"),
+      axis.text.x = element_text(size = 7, color = "black"),
+      axis.title.x = element_text(size = 7, color = "black"),
+      axis.title.y = element_text(size = 7, color = "black"),
+      plot.title = element_text(size = 7, hjust = 0.5),
+      legend.position = "right",
+      legend.title = element_text(size = 7),
+      legend.text = element_text(size = 7),
+      legend.key.size = unit(0.7, "lines"),
+      strip.text = element_text(size = 7, face = "bold", color = "black"),
+      plot.margin = margin(8, 8, 8, 8)
+    ) +
+    guides(
+      color = guide_legend(
+        override.aes = list(
+          shape = 16,
+          size = 2.4
+        )
+      )
+    )
+}
+
+# -----------------------------------------------------------------------------
+# 7. Generate and combine forest plots
+# -----------------------------------------------------------------------------
+pheno_list <- c("dev_lang", "mood_or_anx", "attn_behav", "schiz", "sleep_dx")
+
+plots <- lapply(pheno_list, function(p) plot_forest_one_pheno_ng(meta_logit_asd_FE2, p))
+names(plots) <- pheno_list
+
+plots <- lapply(plots, function(p) p + labs(x = NULL))
+
+for (i in 2:length(plots)) {
+  plots[[i]] <- plots[[i]] +
+    labs(y = NULL) +
+    theme(
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      axis.line.y = element_blank()
+    )
+}
+
+p_all <- wrap_plots(plots, nrow = 1) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+
+p_all <- p_all +
+  plot_annotation(
+    caption = "Odds ratio",
+    theme = theme(
+      plot.caption = element_text(
+        hjust = 0.5,
+        size = 7,
+        margin = margin(t = 8),
+        color = "black"
+      ),
+      plot.margin = margin(5.5, 5.5, 16, 5.5)
+    )
+  )
+
+p_all
